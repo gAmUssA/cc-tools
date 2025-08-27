@@ -1,0 +1,655 @@
+#!/bin/bash
+# cc-key-rotate - Zero-downtime API key rotation utility for Confluent Cloud
+
+# Get script directory and source shared libraries
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+
+source "$LIB_DIR/common.sh"
+source "$LIB_DIR/config.sh"
+source "$LIB_DIR/validation.sh"
+source "$LIB_DIR/output.sh"
+
+# Script metadata
+SCRIPT_NAME="cc-key-rotate"
+SCRIPT_VERSION="1.0.0"
+SCRIPT_DESCRIPTION="Zero-downtime API key rotation utility for Confluent Cloud"
+
+# Default values
+DEFAULT_OUTPUT_FORMAT="table"
+DEFAULT_ROTATION_DELAY=30  # seconds to wait between new key creation and old key deletion
+
+# Usage function
+usage() {
+    cat << EOF
+${BLUE}${SYNC} $SCRIPT_NAME v$SCRIPT_VERSION${RESET}
+$SCRIPT_DESCRIPTION
+
+${YELLOW}Usage:${RESET}
+  $SCRIPT_NAME [OPTIONS] [API_KEY]
+
+${YELLOW}Options:${RESET}
+  -k, --key API_KEY           API key to rotate (interactive if not provided)
+  -d, --delay SECONDS         Delay between new key creation and old key deletion (default: $DEFAULT_ROTATION_DELAY)
+  -o, --output FORMAT         Output format (table, json, csv, yaml)
+  -e, --env-file FILE         Environment file path (default: .env)
+  -q, --quiet                 Suppress non-essential output
+  -v, --verbose               Increase output verbosity
+  -n, --dry-run              Show what would be done without executing
+  -f, --force                Skip confirmation prompts
+  -a, --all                  Rotate all API keys
+  -r, --rollback             Rollback to previous key (if rotation failed)
+  -w, --webhook URL          Webhook URL for notifications
+  -t, --test-new             Test new key before deleting old key
+  -s, --store                Store new key locally after creation
+  -h, --help                 Show this help message
+
+${YELLOW}Examples:${RESET}
+  $SCRIPT_NAME                           # Interactive key selection
+  $SCRIPT_NAME -k ABC123                 # Rotate specific key
+  $SCRIPT_NAME -a -f                     # Rotate all keys without confirmation
+  $SCRIPT_NAME -k ABC123 -d 60 -t        # Rotate with 60s delay and testing
+  $SCRIPT_NAME --rollback -k ABC123      # Rollback failed rotation
+
+${YELLOW}Rotation Process:${RESET}
+  1. Create new API key for same resource
+  2. Wait for specified delay period
+  3. Test new key functionality (if --test-new)
+  4. Update local configurations
+  5. Delete old API key
+  6. Send notifications (if webhook configured)
+
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -k|--key)
+                TARGET_API_KEY="$2"
+                shift 2
+                ;;
+            -d|--delay)
+                ROTATION_DELAY="$2"
+                shift 2
+                ;;
+            -o|--output)
+                OUTPUT_FORMAT="$2"
+                shift 2
+                ;;
+            -e|--env-file)
+                CC_ENV_FILE="$2"
+                shift 2
+                ;;
+            -q|--quiet)
+                CC_QUIET="true"
+                shift
+                ;;
+            -v|--verbose)
+                CC_VERBOSE="true"
+                shift
+                ;;
+            -n|--dry-run)
+                CC_DRY_RUN="true"
+                shift
+                ;;
+            -f|--force)
+                CC_FORCE="true"
+                shift
+                ;;
+            -a|--all)
+                ROTATE_ALL="true"
+                shift
+                ;;
+            -r|--rollback)
+                ROLLBACK_MODE="true"
+                shift
+                ;;
+            -w|--webhook)
+                WEBHOOK_URL="$2"
+                shift 2
+                ;;
+            -t|--test-new)
+                TEST_NEW_KEY="true"
+                shift
+                ;;
+            -s|--store)
+                STORE_LOCALLY="true"
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                if [[ -z "$TARGET_API_KEY" && "$1" =~ ^[A-Za-z0-9]+$ ]]; then
+                    TARGET_API_KEY="$1"
+                    shift
+                else
+                    error "Unknown option: $1"
+                    usage
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+}
+
+# List available API keys
+list_api_keys() {
+    progress "Retrieving API keys"
+    
+    local output
+    if output=$(confluent api-key list --output json 2>&1); then
+        echo "$output" | jq -r '.[] | "\(.key):\(.description):\(.resource_id)"' 2>/dev/null || {
+            # Fallback if jq fails
+            echo "$output" | grep -E "^\s*[A-Za-z0-9]+\s+" | awk '{print $1":"$2":"$3}'
+        }
+    else
+        error "Failed to list API keys: $output"
+        return 1
+    fi
+}
+
+# Select API key interactively
+select_api_key() {
+    if [[ -n "$TARGET_API_KEY" ]]; then
+        return 0
+    fi
+    
+    header "API Key Selection" "$KEY"
+    
+    local keys_info
+    if ! keys_info=$(list_api_keys); then
+        return 1
+    fi
+    
+    if [[ -z "$keys_info" ]]; then
+        error "No API keys found"
+        return 1
+    fi
+    
+    echo -e "${YELLOW}Select API key to rotate:${RESET}"
+    echo
+    
+    local -a keys=()
+    local i=1
+    
+    while IFS=':' read -r key desc resource_id; do
+        keys+=("$key")
+        echo -e "  ${CYAN}$i)${RESET} $key - $desc (Resource: $resource_id)"
+        ((i++))
+    done <<< "$keys_info"
+    
+    echo
+    
+    while true; do
+        read -p "$(echo -e "${YELLOW}Enter choice [1-${#keys[@]}]:${RESET} ")" choice
+        
+        if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && [[ $choice -le ${#keys[@]} ]]; then
+            TARGET_API_KEY="${keys[$((choice-1))]}"
+            success "Selected API key: $TARGET_API_KEY"
+            break
+        else
+            warning "Invalid choice. Please enter a number between 1 and ${#keys[@]}"
+        fi
+    done
+}
+
+# Get API key details
+get_key_details() {
+    local api_key="$1"
+    
+    local output
+    if output=$(confluent api-key describe "$api_key" --output json 2>&1); then
+        echo "$output"
+    else
+        error "Failed to get key details: $output"
+        return 1
+    fi
+}
+
+# Create new API key for same resource
+create_new_key() {
+    local old_key="$1"
+    
+    progress "Getting details for existing key"
+    
+    local key_details
+    if ! key_details=$(get_key_details "$old_key"); then
+        return 1
+    fi
+    
+    local resource_id
+    resource_id=$(echo "$key_details" | jq -r '.resource_id' 2>/dev/null || echo "")
+    
+    if [[ -z "$resource_id" ]]; then
+        error "Could not determine resource ID for key $old_key"
+        return 1
+    fi
+    
+    local description="Rotated from $old_key on $(date '+%Y-%m-%d %H:%M:%S')"
+    
+    progress "Creating new API key for resource $resource_id"
+    
+    local cmd="confluent api-key create --resource $resource_id --description \"$description\""
+    
+    if is_dry_run; then
+        info "DRY RUN: Would execute: $cmd"
+        export NEW_API_KEY="new-key-dry-run"
+        export NEW_API_SECRET="new-secret-dry-run"
+        return 0
+    fi
+    
+    local output
+    if output=$(eval "$cmd" 2>&1); then
+        success "New API key created successfully"
+        
+        # Parse the output to extract key and secret
+        local api_key=$(echo "$output" | grep -oE 'API Key:\s+[A-Za-z0-9]+' | awk '{print $3}')
+        local api_secret=$(echo "$output" | grep -oE 'API Secret:\s+[A-Za-z0-9+/=]+' | awk '{print $3}')
+        
+        if [[ -n "$api_key" && -n "$api_secret" ]]; then
+            export NEW_API_KEY="$api_key"
+            export NEW_API_SECRET="$api_secret"
+            export NEW_RESOURCE_ID="$resource_id"
+            
+            if ! is_quiet; then
+                echo
+                display_key_value \
+                    "Old Key=$old_key" \
+                    "New Key=$api_key" \
+                    "Resource ID=$resource_id" \
+                    "Description=$description"
+            fi
+            
+            return 0
+        else
+            error "Could not parse new API key from output"
+            return 1
+        fi
+    else
+        error "Failed to create new API key: $output"
+        return 1
+    fi
+}
+
+# Test new API key functionality
+test_new_key() {
+    local api_key="$1"
+    local api_secret="$2"
+    local resource_id="$3"
+    
+    if [[ "$TEST_NEW_KEY" != "true" ]]; then
+        return 0
+    fi
+    
+    progress "Testing new API key functionality"
+    
+    if is_dry_run; then
+        info "DRY RUN: Would test new key functionality"
+        return 0
+    fi
+    
+    # Basic connectivity test based on resource type
+    local resource_type
+    if [[ "$resource_id" =~ ^lkc- ]]; then
+        resource_type="kafka"
+    elif [[ "$resource_id" =~ ^psrc- ]]; then
+        resource_type="schema-registry"
+    elif [[ "$resource_id" =~ ^lksqlc- ]]; then
+        resource_type="ksql"
+    elif [[ "$resource_id" =~ ^lcc- ]]; then
+        resource_type="connect"
+    else
+        warning "Unknown resource type for $resource_id, skipping functionality test"
+        return 0
+    fi
+    
+    case "$resource_type" in
+        kafka)
+            # Test Kafka connectivity by listing topics
+            if confluent kafka topic list --api-key "$api_key" --api-secret "$api_secret" >/dev/null 2>&1; then
+                success "Kafka API key test passed"
+                return 0
+            else
+                error "Kafka API key test failed"
+                return 1
+            fi
+            ;;
+        schema-registry)
+            # Test Schema Registry by listing subjects
+            if confluent schema-registry subject list --api-key "$api_key" --api-secret "$api_secret" >/dev/null 2>&1; then
+                success "Schema Registry API key test passed"
+                return 0
+            else
+                error "Schema Registry API key test failed"
+                return 1
+            fi
+            ;;
+        *)
+            info "Functionality test not implemented for $resource_type"
+            return 0
+            ;;
+    esac
+}
+
+# Store new key locally
+store_new_key() {
+    local api_key="$1"
+    local api_secret="$2"
+    
+    if [[ "$STORE_LOCALLY" != "true" ]]; then
+        return 0
+    fi
+    
+    progress "Storing new API key locally"
+    
+    local cmd="confluent api-key store $api_key $api_secret --description \"Rotated key stored by $SCRIPT_NAME\""
+    
+    if is_dry_run; then
+        info "DRY RUN: Would execute: $cmd"
+        return 0
+    fi
+    
+    if eval "$cmd" >/dev/null 2>&1; then
+        success "New API key stored locally"
+        return 0
+    else
+        warning "Failed to store new API key locally"
+        return 1
+    fi
+}
+
+# Delete old API key
+delete_old_key() {
+    local old_key="$1"
+    
+    progress "Deleting old API key"
+    
+    local cmd="confluent api-key delete $old_key"
+    
+    if is_dry_run; then
+        info "DRY RUN: Would execute: $cmd"
+        return 0
+    fi
+    
+    if confirm "Delete old API key $old_key?" "y"; then
+        if eval "$cmd" >/dev/null 2>&1; then
+            success "Old API key deleted successfully"
+            return 0
+        else
+            error "Failed to delete old API key"
+            return 1
+        fi
+    else
+        warning "Old API key deletion cancelled - manual cleanup required"
+        return 1
+    fi
+}
+
+# Send webhook notification
+send_notification() {
+    local status="$1"
+    local old_key="$2"
+    local new_key="$3"
+    local message="$4"
+    
+    if [[ -z "$WEBHOOK_URL" ]]; then
+        return 0
+    fi
+    
+    progress "Sending notification"
+    
+    local payload
+    payload=$(json_object \
+        "event=api_key_rotation" \
+        "status=$status" \
+        "old_key=$old_key" \
+        "new_key=$new_key" \
+        "message=$message" \
+        "timestamp=$(date -Iseconds)" \
+        "host=$(hostname)" \
+        "user=$(whoami)")
+    
+    if is_dry_run; then
+        info "DRY RUN: Would send notification to $WEBHOOK_URL"
+        debug "Payload: $payload"
+        return 0
+    fi
+    
+    if command_exists curl; then
+        if curl -s -X POST -H "Content-Type: application/json" -d "$payload" "$WEBHOOK_URL" >/dev/null 2>&1; then
+            success "Notification sent successfully"
+        else
+            warning "Failed to send notification"
+        fi
+    else
+        warning "curl not available for sending notifications"
+    fi
+}
+
+# Perform key rotation
+rotate_key() {
+    local old_key="$1"
+    
+    header "Rotating API Key: $old_key" "$SYNC"
+    
+    # Step 1: Create new key
+    if ! create_new_key "$old_key"; then
+        send_notification "failed" "$old_key" "" "Failed to create new API key"
+        return 1
+    fi
+    
+    local new_key="$NEW_API_KEY"
+    local new_secret="$NEW_API_SECRET"
+    local resource_id="$NEW_RESOURCE_ID"
+    
+    # Step 2: Wait for propagation
+    if [[ $ROTATION_DELAY -gt 0 ]]; then
+        info "Waiting ${ROTATION_DELAY}s for key propagation..."
+        if ! is_dry_run; then
+            sleep "$ROTATION_DELAY"
+        fi
+    fi
+    
+    # Step 3: Test new key
+    if ! test_new_key "$new_key" "$new_secret" "$resource_id"; then
+        error "New key functionality test failed"
+        warning "New key created but not tested - manual verification required"
+        send_notification "partial" "$old_key" "$new_key" "New key created but functionality test failed"
+        return 1
+    fi
+    
+    # Step 4: Store new key locally
+    store_new_key "$new_key" "$new_secret"
+    
+    # Step 5: Delete old key
+    if ! delete_old_key "$old_key"; then
+        warning "New key is functional but old key deletion failed"
+        send_notification "partial" "$old_key" "$new_key" "New key created but old key deletion failed"
+        return 1
+    fi
+    
+    # Step 6: Send success notification
+    send_notification "success" "$old_key" "$new_key" "API key rotation completed successfully"
+    
+    success "Key rotation completed: $old_key → $new_key"
+    
+    # Output results
+    if [[ "$OUTPUT_FORMAT" != "table" ]]; then
+        output_rotation_results "$old_key" "$new_key" "$resource_id"
+    fi
+    
+    return 0
+}
+
+# Rotate all API keys
+rotate_all_keys() {
+    header "Bulk API Key Rotation" "$SYNC"
+    
+    local keys_info
+    if ! keys_info=$(list_api_keys); then
+        return 1
+    fi
+    
+    if [[ -z "$keys_info" ]]; then
+        error "No API keys found"
+        return 1
+    fi
+    
+    local -a keys=()
+    while IFS=':' read -r key desc resource_id; do
+        keys+=("$key")
+    done <<< "$keys_info"
+    
+    info "Found ${#keys[@]} API keys to rotate"
+    
+    if ! confirm "Rotate ALL ${#keys[@]} API keys?" "n"; then
+        info "Bulk rotation cancelled"
+        return 0
+    fi
+    
+    local success_count=0
+    local failure_count=0
+    
+    for key in "${keys[@]}"; do
+        echo
+        if rotate_key "$key"; then
+            ((success_count++))
+        else
+            ((failure_count++))
+            warning "Failed to rotate key: $key"
+        fi
+    done
+    
+    echo
+    header "Bulk Rotation Summary" "$CHECK"
+    
+    if [[ $success_count -gt 0 ]]; then
+        success "Successfully rotated $success_count keys"
+    fi
+    
+    if [[ $failure_count -gt 0 ]]; then
+        error "Failed to rotate $failure_count keys"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Output rotation results
+output_rotation_results() {
+    local old_key="$1"
+    local new_key="$2"
+    local resource_id="$3"
+    
+    case "${OUTPUT_FORMAT,,}" in
+        json)
+            json_object \
+                "old_key=$old_key" \
+                "new_key=$new_key" \
+                "resource_id=$resource_id" \
+                "rotated_at=$(date -Iseconds)" \
+                "status=success"
+            ;;
+        csv)
+            echo "old_key,new_key,resource_id,rotated_at,status"
+            echo "$old_key,$new_key,$resource_id,$(date -Iseconds),success"
+            ;;
+        yaml)
+            cat << EOF
+old_key: $old_key
+new_key: $new_key
+resource_id: $resource_id
+rotated_at: $(date -Iseconds)
+status: success
+EOF
+            ;;
+        table|*)
+            # Already displayed in rotate_key function
+            ;;
+    esac
+}
+
+# Rollback functionality (placeholder)
+rollback_rotation() {
+    local key="$1"
+    
+    error "Rollback functionality not yet implemented"
+    info "Manual steps for rollback:"
+    info "1. Identify the previous API key from backups or logs"
+    info "2. Recreate the old key if still available"
+    info "3. Update application configurations"
+    info "4. Delete the problematic new key"
+    
+    return 1
+}
+
+# Main function
+main() {
+    # Initialize
+    init_common
+    
+    # Parse arguments
+    parse_args "$@"
+    
+    # Set defaults
+    OUTPUT_FORMAT="${OUTPUT_FORMAT:-$DEFAULT_OUTPUT_FORMAT}"
+    ROTATION_DELAY="${ROTATION_DELAY:-$DEFAULT_ROTATION_DELAY}"
+    ROTATE_ALL="${ROTATE_ALL:-false}"
+    ROLLBACK_MODE="${ROLLBACK_MODE:-false}"
+    TEST_NEW_KEY="${TEST_NEW_KEY:-false}"
+    STORE_LOCALLY="${STORE_LOCALLY:-false}"
+    
+    # Show header
+    if ! is_quiet; then
+        header "$SCRIPT_DESCRIPTION" "$SYNC"
+    fi
+    
+    # Load and validate configuration
+    if ! init_config; then
+        exit 1
+    fi
+    
+    # Check prerequisites
+    if ! check_prerequisites; then
+        exit 1
+    fi
+    
+    # Validate output format
+    if ! validate_output_format "$OUTPUT_FORMAT"; then
+        exit 1
+    fi
+    
+    # Handle rollback mode
+    if [[ "$ROLLBACK_MODE" == "true" ]]; then
+        if [[ -z "$TARGET_API_KEY" ]]; then
+            error "API key required for rollback mode"
+            exit 1
+        fi
+        rollback_rotation "$TARGET_API_KEY"
+        exit $?
+    fi
+    
+    # Handle rotate all mode
+    if [[ "$ROTATE_ALL" == "true" ]]; then
+        rotate_all_keys
+        exit $?
+    fi
+    
+    # Interactive key selection
+    select_api_key
+    
+    # Perform rotation
+    if rotate_key "$TARGET_API_KEY"; then
+        success "API key rotation completed successfully"
+    else
+        error "API key rotation failed"
+        exit 1
+    fi
+}
+
+# Run main function
+main "$@"

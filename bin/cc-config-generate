@@ -1,0 +1,905 @@
+#!/bin/bash
+# cc-config-generate - Multi-client configuration generator for Confluent Cloud
+
+# Get script directory and source shared libraries
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+
+source "$LIB_DIR/common.sh"
+source "$LIB_DIR/config.sh"
+source "$LIB_DIR/validation.sh"
+source "$LIB_DIR/output.sh"
+
+# Script metadata
+SCRIPT_NAME="cc-config-generate"
+SCRIPT_VERSION="1.0.0"
+SCRIPT_DESCRIPTION="Multi-client configuration generator for Confluent Cloud"
+
+# Default values
+DEFAULT_OUTPUT_DIR="configs"
+DEFAULT_CLIENT_TYPE="all"
+
+# Usage function
+usage() {
+    cat << EOF
+${BLUE}${GEAR} $SCRIPT_NAME v$SCRIPT_VERSION${RESET}
+$SCRIPT_DESCRIPTION
+
+${YELLOW}Usage:${RESET}
+  $SCRIPT_NAME [OPTIONS]
+
+${YELLOW}Options:${RESET}
+  -c, --client TYPE           Client type (java, python, nodejs, go, docker, terraform, all)
+  -o, --output-dir DIR        Output directory (default: $DEFAULT_OUTPUT_DIR)
+  -k, --api-key KEY           API key to use (default: from .env)
+  -s, --api-secret SECRET     API secret to use (default: from .env)
+  -t, --template-type TYPE    Template type (client, producer, consumer)
+  -f, --format FORMAT         Config format (properties, env, json, yaml, toml)
+  -e, --env-file FILE         Environment file path (default: .env)
+  -q, --quiet                 Suppress non-essential output
+  -v, --verbose               Increase output verbosity
+  -n, --dry-run              Show what would be generated without creating files
+  -r, --overwrite            Overwrite existing files
+  -p, --prefix PREFIX         File prefix for generated configs
+  -h, --help                 Show this help message
+
+${YELLOW}Examples:${RESET}
+  $SCRIPT_NAME                           # Generate all client configs
+  $SCRIPT_NAME -c java -t producer       # Java producer config only
+  $SCRIPT_NAME -c python -f json         # Python JSON config
+  $SCRIPT_NAME -o /tmp/configs -r        # Custom output dir, overwrite existing
+  $SCRIPT_NAME -c docker -p myapp        # Docker config with prefix
+
+${YELLOW}Client Types:${RESET}
+  java        Java application properties and Kafka properties
+  python      Python client properties and environment files
+  nodejs      Node.js environment and JSON configuration files
+  go          Go YAML and TOML configuration files
+  docker      Docker environment files and compose configs
+  terraform   Terraform variable files
+  all         Generate configurations for all client types
+
+${YELLOW}Template Types:${RESET}
+  client      Generic client configuration
+  producer    Producer-specific configuration
+  consumer    Consumer-specific configuration
+
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -c|--client)
+                CLIENT_TYPE="$2"
+                shift 2
+                ;;
+            -o|--output-dir)
+                OUTPUT_DIR="$2"
+                shift 2
+                ;;
+            -k|--api-key)
+                OVERRIDE_API_KEY="$2"
+                shift 2
+                ;;
+            -s|--api-secret)
+                OVERRIDE_API_SECRET="$2"
+                shift 2
+                ;;
+            -t|--template-type)
+                TEMPLATE_TYPE="$2"
+                shift 2
+                ;;
+            -f|--format)
+                CONFIG_FORMAT="$2"
+                shift 2
+                ;;
+            -e|--env-file)
+                CC_ENV_FILE="$2"
+                shift 2
+                ;;
+            -q|--quiet)
+                CC_QUIET="true"
+                shift
+                ;;
+            -v|--verbose)
+                CC_VERBOSE="true"
+                shift
+                ;;
+            -n|--dry-run)
+                CC_DRY_RUN="true"
+                shift
+                ;;
+            -r|--overwrite)
+                OVERWRITE="true"
+                shift
+                ;;
+            -p|--prefix)
+                FILE_PREFIX="$2"
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# Validate client type
+validate_client_type() {
+    local client_type="$1"
+    local valid_types=("java" "python" "nodejs" "go" "docker" "terraform" "all")
+    
+    for valid_type in "${valid_types[@]}"; do
+        if [[ "$client_type" == "$valid_type" ]]; then
+            return 0
+        fi
+    done
+    
+    error "Invalid client type: $client_type"
+    info "Valid types: ${valid_types[*]}"
+    return 1
+}
+
+# Generate Java configuration
+generate_java_config() {
+    local output_dir="$1"
+    local template_type="$2"
+    local format="$3"
+    
+    progress "Generating Java configuration"
+    
+    local filename
+    case "$template_type" in
+        producer)
+            filename="${FILE_PREFIX}producer.properties"
+            ;;
+        consumer)
+            filename="${FILE_PREFIX}consumer.properties"
+            ;;
+        *)
+            filename="${FILE_PREFIX}client.properties"
+            ;;
+    esac
+    
+    local output_file="$output_dir/$filename"
+    
+    if [[ -f "$output_file" && "$OVERWRITE" != "true" ]]; then
+        warning "File exists: $output_file (use --overwrite to replace)"
+        return 0
+    fi
+    
+    if is_dry_run; then
+        info "DRY RUN: Would create $output_file"
+        return 0
+    fi
+    
+    mkdir -p "$output_dir"
+    
+    cat > "$output_file" << EOF
+# Generated by $SCRIPT_NAME on $(date)
+# Template type: $template_type
+# Client type: Java
+
+# Kafka Cluster Configuration
+bootstrap.servers=${CONFLUENT_BOOTSTRAP_SERVERS}
+security.protocol=SASL_SSL
+sasl.mechanism=PLAIN
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required \\
+    username='${CONFLUENT_CLOUD_API_KEY}' \\
+    password='${CONFLUENT_CLOUD_API_SECRET}';
+
+# Client Configuration
+client.id=${CONFLUENT_CLIENT_ID:-cc-tools-java-client}
+
+EOF
+
+    # Add template-specific configurations
+    case "$template_type" in
+        producer)
+            cat >> "$output_file" << EOF
+# Producer Configuration
+acks=all
+retries=2147483647
+max.in.flight.requests.per.connection=5
+enable.idempotence=true
+compression.type=snappy
+batch.size=16384
+linger.ms=5
+max.request.size=1048576
+
+# Error handling
+retry.backoff.ms=100
+request.timeout.ms=30000
+delivery.timeout.ms=120000
+
+EOF
+            ;;
+        consumer)
+            cat >> "$output_file" << EOF
+# Consumer Configuration
+group.id=${CONFLUENT_CONSUMER_GROUP:-cc-tools-consumer-group}
+auto.offset.reset=earliest
+enable.auto.commit=true
+auto.commit.interval.ms=5000
+session.timeout.ms=30000
+heartbeat.interval.ms=3000
+max.poll.records=500
+max.poll.interval.ms=300000
+
+# Fetch configuration
+fetch.min.bytes=1
+fetch.max.wait.ms=500
+max.partition.fetch.bytes=1048576
+
+EOF
+            ;;
+    esac
+    
+    # Add Schema Registry configuration if available
+    if [[ -n "$CONFLUENT_SCHEMA_REGISTRY_URL" ]]; then
+        cat >> "$output_file" << EOF
+# Schema Registry Configuration
+schema.registry.url=${CONFLUENT_SCHEMA_REGISTRY_URL}
+schema.registry.basic.auth.user.info=${CONFLUENT_SCHEMA_REGISTRY_API_KEY}:${CONFLUENT_SCHEMA_REGISTRY_API_SECRET}
+
+EOF
+    fi
+    
+    success "Generated Java configuration: $output_file"
+    return 0
+}
+
+# Generate Python configuration
+generate_python_config() {
+    local output_dir="$1"
+    local template_type="$2"
+    local format="$3"
+    
+    progress "Generating Python configuration"
+    
+    local filename extension
+    case "$format" in
+        json)
+            filename="${FILE_PREFIX}client.json"
+            extension="json"
+            ;;
+        properties)
+            filename="${FILE_PREFIX}client.properties"
+            extension="properties"
+            ;;
+        *)
+            filename="${FILE_PREFIX}client.env"
+            extension="env"
+            ;;
+    esac
+    
+    local output_file="$output_dir/$filename"
+    
+    if [[ -f "$output_file" && "$OVERWRITE" != "true" ]]; then
+        warning "File exists: $output_file (use --overwrite to replace)"
+        return 0
+    fi
+    
+    if is_dry_run; then
+        info "DRY RUN: Would create $output_file"
+        return 0
+    fi
+    
+    mkdir -p "$output_dir"
+    
+    case "$extension" in
+        json)
+            cat > "$output_file" << EOF
+{
+  "_comment": "Generated by $SCRIPT_NAME on $(date)",
+  "bootstrap.servers": "${CONFLUENT_BOOTSTRAP_SERVERS}",
+  "security.protocol": "SASL_SSL",
+  "sasl.mechanism": "PLAIN",
+  "sasl.username": "${CONFLUENT_CLOUD_API_KEY}",
+  "sasl.password": "${CONFLUENT_CLOUD_API_SECRET}",
+  "client.id": "${CONFLUENT_CLIENT_ID:-cc-tools-python-client}"$(if [[ -n "$CONFLUENT_SCHEMA_REGISTRY_URL" ]]; then echo ',
+  "schema.registry.url": "'$CONFLUENT_SCHEMA_REGISTRY_URL'",
+  "schema.registry.basic.auth.user.info": "'$CONFLUENT_SCHEMA_REGISTRY_API_KEY':'$CONFLUENT_SCHEMA_REGISTRY_API_SECRET'"'; fi)
+}
+EOF
+            ;;
+        properties)
+            cat > "$output_file" << EOF
+# Generated by $SCRIPT_NAME on $(date)
+# Template type: $template_type
+# Client type: Python
+
+bootstrap.servers=${CONFLUENT_BOOTSTRAP_SERVERS}
+security.protocol=SASL_SSL
+sasl.mechanism=PLAIN
+sasl.username=${CONFLUENT_CLOUD_API_KEY}
+sasl.password=${CONFLUENT_CLOUD_API_SECRET}
+client.id=${CONFLUENT_CLIENT_ID:-cc-tools-python-client}
+
+EOF
+            if [[ -n "$CONFLUENT_SCHEMA_REGISTRY_URL" ]]; then
+                cat >> "$output_file" << EOF
+schema.registry.url=${CONFLUENT_SCHEMA_REGISTRY_URL}
+schema.registry.basic.auth.user.info=${CONFLUENT_SCHEMA_REGISTRY_API_KEY}:${CONFLUENT_SCHEMA_REGISTRY_API_SECRET}
+
+EOF
+            fi
+            ;;
+        *)
+            cat > "$output_file" << EOF
+# Generated by $SCRIPT_NAME on $(date)
+# Template type: $template_type
+# Client type: Python
+
+BOOTSTRAP_SERVERS=${CONFLUENT_BOOTSTRAP_SERVERS}
+SECURITY_PROTOCOL=SASL_SSL
+SASL_MECHANISM=PLAIN
+SASL_USERNAME=${CONFLUENT_CLOUD_API_KEY}
+SASL_PASSWORD=${CONFLUENT_CLOUD_API_SECRET}
+CLIENT_ID=${CONFLUENT_CLIENT_ID:-cc-tools-python-client}
+
+EOF
+            if [[ -n "$CONFLUENT_SCHEMA_REGISTRY_URL" ]]; then
+                cat >> "$output_file" << EOF
+SCHEMA_REGISTRY_URL=${CONFLUENT_SCHEMA_REGISTRY_URL}
+SCHEMA_REGISTRY_API_KEY=${CONFLUENT_SCHEMA_REGISTRY_API_KEY}
+SCHEMA_REGISTRY_API_SECRET=${CONFLUENT_SCHEMA_REGISTRY_API_SECRET}
+
+EOF
+            fi
+            ;;
+    esac
+    
+    success "Generated Python configuration: $output_file"
+    return 0
+}
+
+# Generate Node.js configuration
+generate_nodejs_config() {
+    local output_dir="$1"
+    local template_type="$2"
+    local format="$3"
+    
+    progress "Generating Node.js configuration"
+    
+    local filename extension
+    case "$format" in
+        json)
+            filename="${FILE_PREFIX}config.json"
+            extension="json"
+            ;;
+        *)
+            filename="${FILE_PREFIX}.env"
+            extension="env"
+            ;;
+    esac
+    
+    local output_file="$output_dir/$filename"
+    
+    if [[ -f "$output_file" && "$OVERWRITE" != "true" ]]; then
+        warning "File exists: $output_file (use --overwrite to replace)"
+        return 0
+    fi
+    
+    if is_dry_run; then
+        info "DRY RUN: Would create $output_file"
+        return 0
+    fi
+    
+    mkdir -p "$output_dir"
+    
+    case "$extension" in
+        json)
+            cat > "$output_file" << EOF
+{
+  "_comment": "Generated by $SCRIPT_NAME on $(date)",
+  "kafka": {
+    "brokers": ["${CONFLUENT_BOOTSTRAP_SERVERS}"],
+    "ssl": true,
+    "sasl": {
+      "mechanism": "plain",
+      "username": "${CONFLUENT_CLOUD_API_KEY}",
+      "password": "${CONFLUENT_CLOUD_API_SECRET}"
+    },
+    "clientId": "${CONFLUENT_CLIENT_ID:-cc-tools-nodejs-client}"
+  }$(if [[ -n "$CONFLUENT_SCHEMA_REGISTRY_URL" ]]; then echo ',
+  "schemaRegistry": {
+    "url": "'$CONFLUENT_SCHEMA_REGISTRY_URL'",
+    "auth": {
+      "username": "'$CONFLUENT_SCHEMA_REGISTRY_API_KEY'",
+      "password": "'$CONFLUENT_SCHEMA_REGISTRY_API_SECRET'"
+    }
+  }'; fi)
+}
+EOF
+            ;;
+        *)
+            cat > "$output_file" << EOF
+# Generated by $SCRIPT_NAME on $(date)
+# Template type: $template_type
+# Client type: Node.js
+
+KAFKA_BOOTSTRAP_SERVERS=${CONFLUENT_BOOTSTRAP_SERVERS}
+KAFKA_SECURITY_PROTOCOL=SASL_SSL
+KAFKA_SASL_MECHANISM=PLAIN
+KAFKA_SASL_USERNAME=${CONFLUENT_CLOUD_API_KEY}
+KAFKA_SASL_PASSWORD=${CONFLUENT_CLOUD_API_SECRET}
+KAFKA_CLIENT_ID=${CONFLUENT_CLIENT_ID:-cc-tools-nodejs-client}
+
+EOF
+            if [[ -n "$CONFLUENT_SCHEMA_REGISTRY_URL" ]]; then
+                cat >> "$output_file" << EOF
+SCHEMA_REGISTRY_URL=${CONFLUENT_SCHEMA_REGISTRY_URL}
+SCHEMA_REGISTRY_API_KEY=${CONFLUENT_SCHEMA_REGISTRY_API_KEY}
+SCHEMA_REGISTRY_API_SECRET=${CONFLUENT_SCHEMA_REGISTRY_API_SECRET}
+
+EOF
+            fi
+            ;;
+    esac
+    
+    success "Generated Node.js configuration: $output_file"
+    return 0
+}
+
+# Generate Go configuration
+generate_go_config() {
+    local output_dir="$1"
+    local template_type="$2"
+    local format="$3"
+    
+    progress "Generating Go configuration"
+    
+    local filename extension
+    case "$format" in
+        toml)
+            filename="${FILE_PREFIX}config.toml"
+            extension="toml"
+            ;;
+        *)
+            filename="${FILE_PREFIX}config.yaml"
+            extension="yaml"
+            ;;
+    esac
+    
+    local output_file="$output_dir/$filename"
+    
+    if [[ -f "$output_file" && "$OVERWRITE" != "true" ]]; then
+        warning "File exists: $output_file (use --overwrite to replace)"
+        return 0
+    fi
+    
+    if is_dry_run; then
+        info "DRY RUN: Would create $output_file"
+        return 0
+    fi
+    
+    mkdir -p "$output_dir"
+    
+    case "$extension" in
+        toml)
+            cat > "$output_file" << EOF
+# Generated by $SCRIPT_NAME on $(date)
+# Template type: $template_type
+# Client type: Go
+
+[kafka]
+bootstrap_servers = "${CONFLUENT_BOOTSTRAP_SERVERS}"
+security_protocol = "SASL_SSL"
+sasl_mechanism = "PLAIN"
+sasl_username = "${CONFLUENT_CLOUD_API_KEY}"
+sasl_password = "${CONFLUENT_CLOUD_API_SECRET}"
+client_id = "${CONFLUENT_CLIENT_ID:-cc-tools-go-client}"
+
+EOF
+            if [[ -n "$CONFLUENT_SCHEMA_REGISTRY_URL" ]]; then
+                cat >> "$output_file" << EOF
+[schema_registry]
+url = "${CONFLUENT_SCHEMA_REGISTRY_URL}"
+api_key = "${CONFLUENT_SCHEMA_REGISTRY_API_KEY}"
+api_secret = "${CONFLUENT_SCHEMA_REGISTRY_API_SECRET}"
+
+EOF
+            fi
+            ;;
+        *)
+            cat > "$output_file" << EOF
+# Generated by $SCRIPT_NAME on $(date)
+# Template type: $template_type
+# Client type: Go
+
+kafka:
+  bootstrap_servers: "${CONFLUENT_BOOTSTRAP_SERVERS}"
+  security_protocol: "SASL_SSL"
+  sasl_mechanism: "PLAIN"
+  sasl_username: "${CONFLUENT_CLOUD_API_KEY}"
+  sasl_password: "${CONFLUENT_CLOUD_API_SECRET}"
+  client_id: "${CONFLUENT_CLIENT_ID:-cc-tools-go-client}"
+
+EOF
+            if [[ -n "$CONFLUENT_SCHEMA_REGISTRY_URL" ]]; then
+                cat >> "$output_file" << EOF
+schema_registry:
+  url: "${CONFLUENT_SCHEMA_REGISTRY_URL}"
+  api_key: "${CONFLUENT_SCHEMA_REGISTRY_API_KEY}"
+  api_secret: "${CONFLUENT_SCHEMA_REGISTRY_API_SECRET}"
+
+EOF
+            fi
+            ;;
+    esac
+    
+    success "Generated Go configuration: $output_file"
+    return 0
+}
+
+# Generate Docker configuration
+generate_docker_config() {
+    local output_dir="$1"
+    local template_type="$2"
+    local format="$3"
+    
+    progress "Generating Docker configuration"
+    
+    local env_file="$output_dir/${FILE_PREFIX}docker.env"
+    local compose_file="$output_dir/${FILE_PREFIX}docker-compose.yml"
+    
+    if [[ -f "$env_file" && "$OVERWRITE" != "true" ]]; then
+        warning "File exists: $env_file (use --overwrite to replace)"
+        return 0
+    fi
+    
+    if is_dry_run; then
+        info "DRY RUN: Would create $env_file and $compose_file"
+        return 0
+    fi
+    
+    mkdir -p "$output_dir"
+    
+    # Generate environment file
+    cat > "$env_file" << EOF
+# Generated by $SCRIPT_NAME on $(date)
+# Template type: $template_type
+# Client type: Docker
+
+KAFKA_BOOTSTRAP_SERVERS=${CONFLUENT_BOOTSTRAP_SERVERS}
+KAFKA_SECURITY_PROTOCOL=SASL_SSL
+KAFKA_SASL_MECHANISM=PLAIN
+KAFKA_SASL_USERNAME=${CONFLUENT_CLOUD_API_KEY}
+KAFKA_SASL_PASSWORD=${CONFLUENT_CLOUD_API_SECRET}
+KAFKA_CLIENT_ID=${CONFLUENT_CLIENT_ID:-cc-tools-docker-client}
+
+CONFLUENT_ENVIRONMENT_ID=${CONFLUENT_ENVIRONMENT_ID}
+CONFLUENT_CLUSTER_ID=${CONFLUENT_CLUSTER_ID}
+CONFLUENT_REGION=${CONFLUENT_REGION}
+CONFLUENT_CLOUD=${CONFLUENT_CLOUD}
+
+EOF
+    
+    if [[ -n "$CONFLUENT_SCHEMA_REGISTRY_URL" ]]; then
+        cat >> "$env_file" << EOF
+SCHEMA_REGISTRY_URL=${CONFLUENT_SCHEMA_REGISTRY_URL}
+SCHEMA_REGISTRY_API_KEY=${CONFLUENT_SCHEMA_REGISTRY_API_KEY}
+SCHEMA_REGISTRY_API_SECRET=${CONFLUENT_SCHEMA_REGISTRY_API_SECRET}
+
+EOF
+    fi
+    
+    # Generate docker-compose.yml
+    cat > "$compose_file" << EOF
+# Generated by $SCRIPT_NAME on $(date)
+# Docker Compose configuration for Confluent Cloud
+
+version: '3.8'
+
+services:
+  kafka-client:
+    image: confluentinc/cp-kafka:latest
+    env_file:
+      - ${FILE_PREFIX}docker.env
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=\${KAFKA_BOOTSTRAP_SERVERS}
+      - KAFKA_SECURITY_PROTOCOL=\${KAFKA_SECURITY_PROTOCOL}
+      - KAFKA_SASL_MECHANISM=\${KAFKA_SASL_MECHANISM}
+      - KAFKA_SASL_JAAS_CONFIG=org.apache.kafka.common.security.plain.PlainLoginModule required username='\${KAFKA_SASL_USERNAME}' password='\${KAFKA_SASL_PASSWORD}';
+    command: >
+      bash -c "
+        echo 'Kafka client container ready'
+        tail -f /dev/null
+      "
+    networks:
+      - confluent-cloud
+
+networks:
+  confluent-cloud:
+    driver: bridge
+
+EOF
+    
+    success "Generated Docker configuration: $env_file, $compose_file"
+    return 0
+}
+
+# Generate Terraform configuration
+generate_terraform_config() {
+    local output_dir="$1"
+    local template_type="$2"
+    local format="$3"
+    
+    progress "Generating Terraform configuration"
+    
+    local vars_file="$output_dir/${FILE_PREFIX}terraform.tfvars"
+    local tf_file="$output_dir/${FILE_PREFIX}variables.tf"
+    
+    if [[ -f "$vars_file" && "$OVERWRITE" != "true" ]]; then
+        warning "File exists: $vars_file (use --overwrite to replace)"
+        return 0
+    fi
+    
+    if is_dry_run; then
+        info "DRY RUN: Would create $vars_file and $tf_file"
+        return 0
+    fi
+    
+    mkdir -p "$output_dir"
+    
+    # Generate tfvars file
+    cat > "$vars_file" << EOF
+# Generated by $SCRIPT_NAME on $(date)
+# Terraform variables for Confluent Cloud
+
+confluent_cloud_api_key    = "${CONFLUENT_CLOUD_API_KEY}"
+confluent_cloud_api_secret = "${CONFLUENT_CLOUD_API_SECRET}"
+confluent_environment_id   = "${CONFLUENT_ENVIRONMENT_ID}"
+confluent_cluster_id       = "${CONFLUENT_CLUSTER_ID}"
+confluent_bootstrap_servers = "${CONFLUENT_BOOTSTRAP_SERVERS}"
+confluent_region           = "${CONFLUENT_REGION}"
+confluent_cloud_provider   = "${CONFLUENT_CLOUD}"
+
+EOF
+    
+    if [[ -n "$CONFLUENT_SCHEMA_REGISTRY_URL" ]]; then
+        cat >> "$vars_file" << EOF
+schema_registry_url        = "${CONFLUENT_SCHEMA_REGISTRY_URL}"
+schema_registry_api_key    = "${CONFLUENT_SCHEMA_REGISTRY_API_KEY}"
+schema_registry_api_secret = "${CONFLUENT_SCHEMA_REGISTRY_API_SECRET}"
+
+EOF
+    fi
+    
+    # Generate variables.tf file
+    cat > "$tf_file" << EOF
+# Generated by $SCRIPT_NAME on $(date)
+# Terraform variable definitions for Confluent Cloud
+
+variable "confluent_cloud_api_key" {
+  description = "Confluent Cloud API Key"
+  type        = string
+  sensitive   = true
+}
+
+variable "confluent_cloud_api_secret" {
+  description = "Confluent Cloud API Secret"
+  type        = string
+  sensitive   = true
+}
+
+variable "confluent_environment_id" {
+  description = "Confluent Cloud Environment ID"
+  type        = string
+}
+
+variable "confluent_cluster_id" {
+  description = "Confluent Cloud Cluster ID"
+  type        = string
+}
+
+variable "confluent_bootstrap_servers" {
+  description = "Kafka Bootstrap Servers"
+  type        = string
+}
+
+variable "confluent_region" {
+  description = "Confluent Cloud Region"
+  type        = string
+}
+
+variable "confluent_cloud_provider" {
+  description = "Cloud Provider (aws, gcp, azure)"
+  type        = string
+}
+
+EOF
+    
+    if [[ -n "$CONFLUENT_SCHEMA_REGISTRY_URL" ]]; then
+        cat >> "$tf_file" << EOF
+variable "schema_registry_url" {
+  description = "Schema Registry URL"
+  type        = string
+}
+
+variable "schema_registry_api_key" {
+  description = "Schema Registry API Key"
+  type        = string
+  sensitive   = true
+}
+
+variable "schema_registry_api_secret" {
+  description = "Schema Registry API Secret"
+  type        = string
+  sensitive   = true
+}
+
+EOF
+    fi
+    
+    success "Generated Terraform configuration: $vars_file, $tf_file"
+    return 0
+}
+
+# Generate configurations for all client types
+generate_all_configs() {
+    local output_dir="$1"
+    local template_type="$2"
+    
+    header "Generating All Client Configurations" "$GEAR"
+    
+    local clients=("java" "python" "nodejs" "go" "docker" "terraform")
+    local success_count=0
+    local failure_count=0
+    
+    for client in "${clients[@]}"; do
+        echo
+        if generate_client_config "$client" "$output_dir" "$template_type" ""; then
+            ((success_count++))
+        else
+            ((failure_count++))
+            warning "Failed to generate $client configuration"
+        fi
+    done
+    
+    echo
+    header "Generation Summary" "$CHECK"
+    
+    display_key_value \
+        "Total Clients=${#clients[@]}" \
+        "Successful=$success_count" \
+        "Failed=$failure_count" \
+        "Output Directory=$output_dir"
+    
+    if [[ $failure_count -gt 0 ]]; then
+        return 1
+    fi
+    
+    return 0
+}
+
+# Generate configuration for specific client type
+generate_client_config() {
+    local client_type="$1"
+    local output_dir="$2"
+    local template_type="$3"
+    local format="$4"
+    
+    case "$client_type" in
+        java)
+            generate_java_config "$output_dir" "$template_type" "$format"
+            ;;
+        python)
+            generate_python_config "$output_dir" "$template_type" "$format"
+            ;;
+        nodejs)
+            generate_nodejs_config "$output_dir" "$template_type" "$format"
+            ;;
+        go)
+            generate_go_config "$output_dir" "$template_type" "$format"
+            ;;
+        docker)
+            generate_docker_config "$output_dir" "$template_type" "$format"
+            ;;
+        terraform)
+            generate_terraform_config "$output_dir" "$template_type" "$format"
+            ;;
+        all)
+            generate_all_configs "$output_dir" "$template_type"
+            ;;
+        *)
+            error "Unsupported client type: $client_type"
+            return 1
+            ;;
+    esac
+}
+
+# Main function
+main() {
+    # Initialize
+    init_common
+    
+    # Parse arguments
+    parse_args "$@"
+    
+    # Set defaults
+    CLIENT_TYPE="${CLIENT_TYPE:-$DEFAULT_CLIENT_TYPE}"
+    OUTPUT_DIR="${OUTPUT_DIR:-$DEFAULT_OUTPUT_DIR}"
+    TEMPLATE_TYPE="${TEMPLATE_TYPE:-client}"
+    CONFIG_FORMAT="${CONFIG_FORMAT:-}"
+    OVERWRITE="${OVERWRITE:-false}"
+    FILE_PREFIX="${FILE_PREFIX:-}"
+    
+    # Show header
+    if ! is_quiet; then
+        header "$SCRIPT_DESCRIPTION" "$GEAR"
+    fi
+    
+    # Load and validate configuration
+    if ! init_config; then
+        exit 1
+    fi
+    
+    # Override credentials if provided
+    if [[ -n "$OVERRIDE_API_KEY" ]]; then
+        export CONFLUENT_CLOUD_API_KEY="$OVERRIDE_API_KEY"
+    fi
+    
+    if [[ -n "$OVERRIDE_API_SECRET" ]]; then
+        export CONFLUENT_CLOUD_API_SECRET="$OVERRIDE_API_SECRET"
+    fi
+    
+    # Validate client type
+    if ! validate_client_type "$CLIENT_TYPE"; then
+        exit 1
+    fi
+    
+    # Validate template type
+    local valid_templates=("client" "producer" "consumer")
+    local template_valid=false
+    for template in "${valid_templates[@]}"; do
+        if [[ "$TEMPLATE_TYPE" == "$template" ]]; then
+            template_valid=true
+            break
+        fi
+    done
+    
+    if [[ "$template_valid" != "true" ]]; then
+        error "Invalid template type: $TEMPLATE_TYPE"
+        info "Valid templates: ${valid_templates[*]}"
+        exit 1
+    fi
+    
+    # Create output directory
+    if ! is_dry_run; then
+        if ! mkdir -p "$OUTPUT_DIR"; then
+            error "Failed to create output directory: $OUTPUT_DIR"
+            exit 1
+        fi
+    fi
+    
+    # Generate configurations
+    if generate_client_config "$CLIENT_TYPE" "$OUTPUT_DIR" "$TEMPLATE_TYPE" "$CONFIG_FORMAT"; then
+        success "Configuration generation completed successfully"
+        
+        if ! is_quiet && ! is_dry_run; then
+            echo
+            info "Generated configurations in: $OUTPUT_DIR"
+            if command_exists find; then
+                find "$OUTPUT_DIR" -type f -name "${FILE_PREFIX}*" | while read -r file; do
+                    echo -e "  ${GREEN}${CHECK}${RESET} $file"
+                done
+            fi
+        fi
+    else
+        error "Configuration generation failed"
+        exit 1
+    fi
+}
+
+# Run main function
+main "$@"

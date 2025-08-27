@@ -1,0 +1,710 @@
+#!/bin/bash
+# cc-key-health - API key health monitoring and validation utility for Confluent Cloud
+
+# Get script directory and source shared libraries
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+
+source "$LIB_DIR/common.sh"
+source "$LIB_DIR/config.sh"
+source "$LIB_DIR/validation.sh"
+source "$LIB_DIR/output.sh"
+
+# Script metadata
+SCRIPT_NAME="cc-key-health"
+SCRIPT_VERSION="1.0.0"
+SCRIPT_DESCRIPTION="API key health monitoring and validation utility for Confluent Cloud"
+
+# Default values
+DEFAULT_OUTPUT_FORMAT="table"
+DEFAULT_TIMEOUT=30
+DEFAULT_EXPIRY_WARNING_DAYS=30
+
+# Usage function
+usage() {
+    cat << EOF
+${BLUE}${HEALTH} $SCRIPT_NAME v$SCRIPT_VERSION${RESET}
+$SCRIPT_DESCRIPTION
+
+${YELLOW}Usage:${RESET}
+  $SCRIPT_NAME [OPTIONS] [API_KEY]
+
+${YELLOW}Options:${RESET}
+  -k, --key API_KEY           Check specific API key (interactive if not provided)
+  -a, --all                   Check all API keys
+  -o, --output FORMAT         Output format (table, json, csv, yaml)
+  -t, --timeout SECONDS       Connection timeout (default: $DEFAULT_TIMEOUT)
+  -w, --warning-days DAYS     Expiry warning threshold (default: $DEFAULT_EXPIRY_WARNING_DAYS)
+  -e, --env-file FILE         Environment file path (default: .env)
+  -q, --quiet                 Suppress non-essential output
+  -v, --verbose               Increase output verbosity
+  -c, --connectivity          Test network connectivity only
+  -p, --permissions           Test permissions only
+  -b, --benchmark             Run performance benchmarks
+  -s, --summary               Show summary only
+  -f, --fix                   Attempt to fix detected issues
+  -h, --help                 Show this help message
+
+${YELLOW}Examples:${RESET}
+  $SCRIPT_NAME                           # Interactive key selection
+  $SCRIPT_NAME -k ABC123                 # Check specific key
+  $SCRIPT_NAME -a -s                     # Check all keys with summary
+  $SCRIPT_NAME -c -t 10                  # Connectivity test with 10s timeout
+  $SCRIPT_NAME -b -k ABC123              # Benchmark specific key
+
+${YELLOW}Health Checks:${RESET}
+  • Key validity and authentication
+  • Network connectivity to resources
+  • Permission scope verification
+  • Performance benchmarking
+  • Expiration monitoring
+  • Resource accessibility
+
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -k|--key)
+                TARGET_API_KEY="$2"
+                shift 2
+                ;;
+            -a|--all)
+                CHECK_ALL="true"
+                shift
+                ;;
+            -o|--output)
+                OUTPUT_FORMAT="$2"
+                shift 2
+                ;;
+            -t|--timeout)
+                TIMEOUT="$2"
+                shift 2
+                ;;
+            -w|--warning-days)
+                EXPIRY_WARNING_DAYS="$2"
+                shift 2
+                ;;
+            -e|--env-file)
+                CC_ENV_FILE="$2"
+                shift 2
+                ;;
+            -q|--quiet)
+                CC_QUIET="true"
+                shift
+                ;;
+            -v|--verbose)
+                CC_VERBOSE="true"
+                shift
+                ;;
+            -c|--connectivity)
+                CONNECTIVITY_ONLY="true"
+                shift
+                ;;
+            -p|--permissions)
+                PERMISSIONS_ONLY="true"
+                shift
+                ;;
+            -b|--benchmark)
+                BENCHMARK_MODE="true"
+                shift
+                ;;
+            -s|--summary)
+                SUMMARY_ONLY="true"
+                shift
+                ;;
+            -f|--fix)
+                FIX_ISSUES="true"
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                if [[ -z "$TARGET_API_KEY" && "$1" =~ ^[A-Za-z0-9]+$ ]]; then
+                    TARGET_API_KEY="$1"
+                    shift
+                else
+                    error "Unknown option: $1"
+                    usage
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+}
+
+# Get API key details
+get_key_info() {
+    local api_key="$1"
+    
+    local output
+    if output=$(confluent api-key describe "$api_key" --output json 2>&1); then
+        echo "$output"
+    else
+        debug "Failed to get key info: $output"
+        return 1
+    fi
+}
+
+# Test API key validity
+test_key_validity() {
+    local api_key="$1"
+    local api_secret="$2"
+    
+    progress "Testing API key validity"
+    
+    # Try to use the key with a simple operation
+    local test_cmd="confluent api-key list --api-key $api_key --api-secret $api_secret"
+    
+    if timeout "$TIMEOUT" $test_cmd >/dev/null 2>&1; then
+        success "API key is valid and authenticated"
+        return 0
+    else
+        error "API key validation failed"
+        return 1
+    fi
+}
+
+# Test network connectivity
+test_connectivity() {
+    local resource_id="$1"
+    local api_key="$2"
+    local api_secret="$3"
+    
+    progress "Testing network connectivity"
+    
+    local resource_type=""
+    local endpoint=""
+    
+    # Determine resource type and endpoint
+    if [[ "$resource_id" =~ ^lkc- ]]; then
+        resource_type="kafka"
+        endpoint="$CONFLUENT_BOOTSTRAP_SERVERS"
+    elif [[ "$resource_id" =~ ^psrc- ]]; then
+        resource_type="schema-registry"
+        endpoint="$CONFLUENT_SCHEMA_REGISTRY_URL"
+    elif [[ "$resource_id" =~ ^lksqlc- ]]; then
+        resource_type="ksql"
+        endpoint="$CONFLUENT_KSQL_ENDPOINT"
+    elif [[ "$resource_id" =~ ^lcc- ]]; then
+        resource_type="connect"
+        endpoint="$CONFLUENT_CONNECT_ENDPOINT"
+    else
+        warning "Unknown resource type for $resource_id"
+        return 0
+    fi
+    
+    if [[ -z "$endpoint" ]]; then
+        warning "No endpoint configured for $resource_type"
+        return 0
+    fi
+    
+    # Test basic connectivity
+    local host port
+    if [[ "$endpoint" =~ ^https?:// ]]; then
+        host=$(echo "$endpoint" | sed -E 's|^https?://([^:/]+).*|\1|')
+        port=$(echo "$endpoint" | sed -E 's|^https?://[^:]+:?([0-9]+)?.*|\1|')
+        port=${port:-443}
+    else
+        host="${endpoint%:*}"
+        port="${endpoint##*:}"
+    fi
+    
+    if command_exists nc; then
+        if timeout "$TIMEOUT" nc -z "$host" "$port" 2>/dev/null; then
+            success "Network connectivity to $host:$port successful"
+            return 0
+        else
+            error "Network connectivity to $host:$port failed"
+            return 1
+        fi
+    elif command_exists telnet; then
+        if timeout "$TIMEOUT" bash -c "echo '' | telnet $host $port" 2>/dev/null | grep -q "Connected"; then
+            success "Network connectivity to $host:$port successful"
+            return 0
+        else
+            error "Network connectivity to $host:$port failed"
+            return 1
+        fi
+    else
+        warning "No network testing tools available (nc, telnet)"
+        return 0
+    fi
+}
+
+# Test API key permissions
+test_permissions() {
+    local resource_id="$1"
+    local api_key="$2"
+    local api_secret="$3"
+    
+    progress "Testing API key permissions"
+    
+    local resource_type=""
+    
+    # Determine resource type
+    if [[ "$resource_id" =~ ^lkc- ]]; then
+        resource_type="kafka"
+    elif [[ "$resource_id" =~ ^psrc- ]]; then
+        resource_type="schema-registry"
+    elif [[ "$resource_id" =~ ^lksqlc- ]]; then
+        resource_type="ksql"
+    elif [[ "$resource_id" =~ ^lcc- ]]; then
+        resource_type="connect"
+    else
+        warning "Unknown resource type for $resource_id"
+        return 0
+    fi
+    
+    case "$resource_type" in
+        kafka)
+            # Test Kafka permissions
+            if timeout "$TIMEOUT" confluent kafka topic list --api-key "$api_key" --api-secret "$api_secret" >/dev/null 2>&1; then
+                success "Kafka read permissions verified"
+            else
+                error "Kafka read permissions failed"
+                return 1
+            fi
+            ;;
+        schema-registry)
+            # Test Schema Registry permissions
+            if timeout "$TIMEOUT" confluent schema-registry subject list --api-key "$api_key" --api-secret "$api_secret" >/dev/null 2>&1; then
+                success "Schema Registry read permissions verified"
+            else
+                error "Schema Registry read permissions failed"
+                return 1
+            fi
+            ;;
+        ksql)
+            # Test ksqlDB permissions (placeholder)
+            info "ksqlDB permission testing not implemented"
+            ;;
+        connect)
+            # Test Connect permissions (placeholder)
+            info "Connect permission testing not implemented"
+            ;;
+    esac
+    
+    return 0
+}
+
+# Run performance benchmark
+run_benchmark() {
+    local resource_id="$1"
+    local api_key="$2"
+    local api_secret="$3"
+    
+    progress "Running performance benchmark"
+    
+    local resource_type=""
+    
+    # Determine resource type
+    if [[ "$resource_id" =~ ^lkc- ]]; then
+        resource_type="kafka"
+    elif [[ "$resource_id" =~ ^psrc- ]]; then
+        resource_type="schema-registry"
+    else
+        info "Performance benchmarking only available for Kafka clusters"
+        return 0
+    fi
+    
+    case "$resource_type" in
+        kafka)
+            # Simple Kafka benchmark - measure topic list response time
+            local start_time end_time duration
+            start_time=$(date +%s%N)
+            
+            if confluent kafka topic list --api-key "$api_key" --api-secret "$api_secret" >/dev/null 2>&1; then
+                end_time=$(date +%s%N)
+                duration=$(( (end_time - start_time) / 1000000 ))  # Convert to milliseconds
+                
+                if [[ $duration -lt 1000 ]]; then
+                    success "Kafka API response time: ${duration}ms (excellent)"
+                elif [[ $duration -lt 3000 ]]; then
+                    info "Kafka API response time: ${duration}ms (good)"
+                else
+                    warning "Kafka API response time: ${duration}ms (slow)"
+                fi
+                
+                export BENCHMARK_RESULT="$duration"
+            else
+                error "Kafka benchmark failed"
+                return 1
+            fi
+            ;;
+        schema-registry)
+            # Simple Schema Registry benchmark
+            local start_time end_time duration
+            start_time=$(date +%s%N)
+            
+            if confluent schema-registry subject list --api-key "$api_key" --api-secret "$api_secret" >/dev/null 2>&1; then
+                end_time=$(date +%s%N)
+                duration=$(( (end_time - start_time) / 1000000 ))
+                
+                if [[ $duration -lt 500 ]]; then
+                    success "Schema Registry API response time: ${duration}ms (excellent)"
+                elif [[ $duration -lt 1500 ]]; then
+                    info "Schema Registry API response time: ${duration}ms (good)"
+                else
+                    warning "Schema Registry API response time: ${duration}ms (slow)"
+                fi
+                
+                export BENCHMARK_RESULT="$duration"
+            else
+                error "Schema Registry benchmark failed"
+                return 1
+            fi
+            ;;
+    esac
+    
+    return 0
+}
+
+# Check key expiration
+check_expiration() {
+    local key_info="$1"
+    
+    # Note: Confluent Cloud API keys don't typically have expiration dates
+    # This is a placeholder for future functionality
+    info "API key expiration checking not available (keys don't expire)"
+    return 0
+}
+
+# Calculate health score
+calculate_health_score() {
+    local validity_ok="$1"
+    local connectivity_ok="$2"
+    local permissions_ok="$3"
+    local benchmark_result="$4"
+    
+    local score=0
+    local max_score=100
+    
+    # Validity (40 points)
+    if [[ "$validity_ok" == "true" ]]; then
+        score=$((score + 40))
+    fi
+    
+    # Connectivity (30 points)
+    if [[ "$connectivity_ok" == "true" ]]; then
+        score=$((score + 30))
+    fi
+    
+    # Permissions (20 points)
+    if [[ "$permissions_ok" == "true" ]]; then
+        score=$((score + 20))
+    fi
+    
+    # Performance (10 points)
+    if [[ -n "$benchmark_result" && "$benchmark_result" != "failed" ]]; then
+        if [[ $benchmark_result -lt 1000 ]]; then
+            score=$((score + 10))
+        elif [[ $benchmark_result -lt 3000 ]]; then
+            score=$((score + 5))
+        fi
+    fi
+    
+    echo "$score"
+}
+
+# Perform comprehensive health check
+health_check_key() {
+    local api_key="$1"
+    local api_secret="$2"
+    
+    header "Health Check: $api_key" "$HEALTH"
+    
+    # Get key information
+    local key_info
+    key_info=$(get_key_info "$api_key" 2>/dev/null || echo '{}')
+    
+    local resource_id
+    if command_exists jq; then
+        resource_id=$(echo "$key_info" | jq -r '.resource_id // "unknown"')
+    else
+        resource_id="unknown"
+    fi
+    
+    local validity_ok="false"
+    local connectivity_ok="false"
+    local permissions_ok="false"
+    local benchmark_result=""
+    
+    # Test validity
+    if [[ "$PERMISSIONS_ONLY" != "true" && "$BENCHMARK_MODE" != "true" ]]; then
+        if test_key_validity "$api_key" "$api_secret"; then
+            validity_ok="true"
+        fi
+    fi
+    
+    # Test connectivity
+    if [[ "$PERMISSIONS_ONLY" != "true" && "$BENCHMARK_MODE" != "true" ]] || [[ "$CONNECTIVITY_ONLY" == "true" ]]; then
+        if test_connectivity "$resource_id" "$api_key" "$api_secret"; then
+            connectivity_ok="true"
+        fi
+    fi
+    
+    # Test permissions
+    if [[ "$CONNECTIVITY_ONLY" != "true" && "$BENCHMARK_MODE" != "true" ]] || [[ "$PERMISSIONS_ONLY" == "true" ]]; then
+        if test_permissions "$resource_id" "$api_key" "$api_secret"; then
+            permissions_ok="true"
+        fi
+    fi
+    
+    # Run benchmark
+    if [[ "$BENCHMARK_MODE" == "true" ]]; then
+        if run_benchmark "$resource_id" "$api_key" "$api_secret"; then
+            benchmark_result="$BENCHMARK_RESULT"
+        else
+            benchmark_result="failed"
+        fi
+    fi
+    
+    # Check expiration
+    check_expiration "$key_info"
+    
+    # Calculate health score
+    local health_score
+    health_score=$(calculate_health_score "$validity_ok" "$connectivity_ok" "$permissions_ok" "$benchmark_result")
+    
+    # Store results for output
+    export HEALTH_CHECK_RESULT=$(json_object \
+        "api_key=$api_key" \
+        "resource_id=$resource_id" \
+        "validity_ok=$validity_ok" \
+        "connectivity_ok=$connectivity_ok" \
+        "permissions_ok=$permissions_ok" \
+        "benchmark_result=$benchmark_result" \
+        "health_score=$health_score" \
+        "checked_at=$(date -Iseconds)")
+    
+    # Display summary
+    echo
+    display_key_value \
+        "API Key=$api_key" \
+        "Resource ID=$resource_id" \
+        "Validity=$validity_ok" \
+        "Connectivity=$connectivity_ok" \
+        "Permissions=$permissions_ok" \
+        "Health Score=$health_score/100"
+    
+    if [[ -n "$benchmark_result" && "$benchmark_result" != "failed" ]]; then
+        display_key_value "Response Time=${benchmark_result}ms"
+    fi
+    
+    return 0
+}
+
+# List and select API key
+select_api_key() {
+    if [[ -n "$TARGET_API_KEY" ]]; then
+        return 0
+    fi
+    
+    header "API Key Selection" "$KEY"
+    
+    local keys_output
+    if ! keys_output=$(confluent api-key list 2>&1); then
+        error "Failed to list API keys: $keys_output"
+        return 1
+    fi
+    
+    # Parse keys (simple approach)
+    local -a keys=()
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*([A-Za-z0-9]+) ]]; then
+            keys+=("${BASH_REMATCH[1]}")
+        fi
+    done <<< "$keys_output"
+    
+    if [[ ${#keys[@]} -eq 0 ]]; then
+        error "No API keys found"
+        return 1
+    fi
+    
+    echo -e "${YELLOW}Select API key to check:${RESET}"
+    echo
+    
+    for i in "${!keys[@]}"; do
+        echo -e "  ${CYAN}$((i+1)))${RESET} ${keys[i]}"
+    done
+    
+    echo
+    
+    while true; do
+        read -p "$(echo -e "${YELLOW}Enter choice [1-${#keys[@]}]:${RESET} ")" choice
+        
+        if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && [[ $choice -le ${#keys[@]} ]]; then
+            TARGET_API_KEY="${keys[$((choice-1))]}"
+            success "Selected API key: $TARGET_API_KEY"
+            break
+        else
+            warning "Invalid choice. Please enter a number between 1 and ${#keys[@]}"
+        fi
+    done
+}
+
+# Check all API keys
+check_all_keys() {
+    header "Health Check: All API Keys" "$HEALTH"
+    
+    local keys_output
+    if ! keys_output=$(confluent api-key list 2>&1); then
+        error "Failed to list API keys: $keys_output"
+        return 1
+    fi
+    
+    local -a keys=()
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*([A-Za-z0-9]+) ]]; then
+            keys+=("${BASH_REMATCH[1]}")
+        fi
+    done <<< "$keys_output"
+    
+    if [[ ${#keys[@]} -eq 0 ]]; then
+        error "No API keys found"
+        return 1
+    fi
+    
+    info "Checking ${#keys[@]} API keys"
+    
+    local healthy_count=0
+    local unhealthy_count=0
+    local results=()
+    
+    for key in "${keys[@]}"; do
+        echo
+        # Note: We can't get the secret for existing keys, so we'll do limited checks
+        if health_check_key "$key" ""; then
+            if [[ -n "$HEALTH_CHECK_RESULT" ]]; then
+                results+=("$HEALTH_CHECK_RESULT")
+                local score
+                if command_exists jq; then
+                    score=$(echo "$HEALTH_CHECK_RESULT" | jq -r '.health_score')
+                    if [[ $score -ge 70 ]]; then
+                        ((healthy_count++))
+                    else
+                        ((unhealthy_count++))
+                    fi
+                fi
+            fi
+        else
+            ((unhealthy_count++))
+        fi
+    done
+    
+    # Summary
+    echo
+    header "Health Check Summary" "$CHECK"
+    
+    display_key_value \
+        "Total Keys=${#keys[@]}" \
+        "Healthy Keys=$healthy_count" \
+        "Unhealthy Keys=$unhealthy_count"
+    
+    return 0
+}
+
+# Output health results
+output_health_results() {
+    local result="$1"
+    
+    case "${OUTPUT_FORMAT,,}" in
+        json)
+            echo "$result" | jq .
+            ;;
+        csv)
+            if command_exists jq; then
+                echo "api_key,resource_id,validity_ok,connectivity_ok,permissions_ok,benchmark_result,health_score,checked_at"
+                echo "$result" | jq -r '[.api_key, .resource_id, .validity_ok, .connectivity_ok, .permissions_ok, .benchmark_result, .health_score, .checked_at] | @csv'
+            fi
+            ;;
+        yaml)
+            if command_exists yq; then
+                echo "$result" | yq .
+            else
+                echo "# Health check result"
+                if command_exists jq; then
+                    echo "$result" | jq -r 'to_entries[] | "\(.key): \(.value)"'
+                fi
+            fi
+            ;;
+        table|*)
+            # Already displayed in health_check_key function
+            ;;
+    esac
+}
+
+# Main function
+main() {
+    # Initialize
+    init_common
+    
+    # Parse arguments
+    parse_args "$@"
+    
+    # Set defaults
+    OUTPUT_FORMAT="${OUTPUT_FORMAT:-$DEFAULT_OUTPUT_FORMAT}"
+    TIMEOUT="${TIMEOUT:-$DEFAULT_TIMEOUT}"
+    EXPIRY_WARNING_DAYS="${EXPIRY_WARNING_DAYS:-$DEFAULT_EXPIRY_WARNING_DAYS}"
+    CHECK_ALL="${CHECK_ALL:-false}"
+    CONNECTIVITY_ONLY="${CONNECTIVITY_ONLY:-false}"
+    PERMISSIONS_ONLY="${PERMISSIONS_ONLY:-false}"
+    BENCHMARK_MODE="${BENCHMARK_MODE:-false}"
+    SUMMARY_ONLY="${SUMMARY_ONLY:-false}"
+    FIX_ISSUES="${FIX_ISSUES:-false}"
+    
+    # Show header
+    if ! is_quiet; then
+        header "$SCRIPT_DESCRIPTION" "$HEALTH"
+    fi
+    
+    # Load and validate configuration
+    if ! init_config; then
+        exit 1
+    fi
+    
+    # Check prerequisites
+    if ! check_prerequisites; then
+        exit 1
+    fi
+    
+    # Validate output format
+    if ! validate_output_format "$OUTPUT_FORMAT"; then
+        exit 1
+    fi
+    
+    # Handle check all mode
+    if [[ "$CHECK_ALL" == "true" ]]; then
+        check_all_keys
+        exit $?
+    fi
+    
+    # Interactive key selection
+    select_api_key
+    
+    # Get API key secret (note: this is a limitation - we can't retrieve secrets for existing keys)
+    local api_secret=""
+    if [[ -z "$api_secret" ]]; then
+        warning "API key secret not available - limited health checks will be performed"
+        info "For full health checks, use keys created with cc-key-create --store"
+    fi
+    
+    # Perform health check
+    if health_check_key "$TARGET_API_KEY" "$api_secret"; then
+        if [[ -n "$HEALTH_CHECK_RESULT" && "$OUTPUT_FORMAT" != "table" ]]; then
+            output_health_results "$HEALTH_CHECK_RESULT"
+        fi
+        success "Health check completed"
+    else
+        error "Health check failed"
+        exit 1
+    fi
+}
+
+# Run main function
+main "$@"

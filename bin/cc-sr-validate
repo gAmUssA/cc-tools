@@ -1,0 +1,442 @@
+#!/bin/bash
+# cc-sr-validate - Schema Registry connectivity validation utility for Confluent Cloud
+
+# Get script directory and source shared libraries
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+
+source "$LIB_DIR/common.sh"
+source "$LIB_DIR/config.sh"
+source "$LIB_DIR/validation.sh"
+source "$LIB_DIR/output.sh"
+
+# Script metadata
+SCRIPT_NAME="cc-sr-validate"
+SCRIPT_VERSION="1.0.0"
+SCRIPT_DESCRIPTION="Schema Registry connectivity validation utility for Confluent Cloud"
+
+# Default values
+DEFAULT_OUTPUT_FORMAT="table"
+DEFAULT_TIMEOUT=10
+
+# Usage function
+usage() {
+    cat << EOF
+${BLUE}🔍 $SCRIPT_NAME v$SCRIPT_VERSION${RESET}
+$SCRIPT_DESCRIPTION
+
+${YELLOW}Usage:${RESET}
+  $SCRIPT_NAME [OPTIONS]
+
+${YELLOW}Options:${RESET}
+  -u, --url URL               Schema Registry URL
+  -k, --api-key KEY           API key for authentication
+  -s, --api-secret SECRET     API secret for authentication
+  -o, --output FORMAT         Output format (table, json, csv)
+  -t, --timeout SECONDS       Connection timeout (default: $DEFAULT_TIMEOUT)
+  -e, --env-file FILE         Environment file path (default: .env)
+  -q, --quiet                 Suppress non-essential output
+  -v, --verbose               Increase output verbosity
+  -d, --diagnostics           Run full diagnostics
+  --subject SUBJECT           Test specific subject
+  --ssl-verify                Verify SSL/TLS certificates
+  -h, --help                 Show this help message
+
+${YELLOW}Examples:${RESET}
+  $SCRIPT_NAME                                    # Use credentials from .env
+  $SCRIPT_NAME -d                                 # Run full diagnostics
+  $SCRIPT_NAME --subject my-topic-value           # Test specific subject
+  $SCRIPT_NAME -u https://psrc-xxx.confluent.cloud -k KEY -s SECRET
+  $SCRIPT_NAME --ssl-verify                       # Verify SSL certificates
+
+${YELLOW}Environment Variables:${RESET}
+  CC_SR_HOST                  Schema Registry host
+  CC_SR_API_KEY              Schema Registry API key
+  CC_SR_API_SECRET           Schema Registry API secret
+
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -u|--url)
+                SR_URL="$2"
+                shift 2
+                ;;
+            -k|--api-key)
+                SR_API_KEY="$2"
+                shift 2
+                ;;
+            -s|--api-secret)
+                SR_API_SECRET="$2"
+                shift 2
+                ;;
+            -o|--output)
+                OUTPUT_FORMAT="$2"
+                shift 2
+                ;;
+            -t|--timeout)
+                TIMEOUT="$2"
+                shift 2
+                ;;
+            -e|--env-file)
+                CC_ENV_FILE="$2"
+                shift 2
+                ;;
+            -q|--quiet)
+                CC_QUIET="true"
+                shift
+                ;;
+            -v|--verbose)
+                CC_VERBOSE="true"
+                shift
+                ;;
+            -d|--diagnostics)
+                RUN_DIAGNOSTICS="true"
+                shift
+                ;;
+            --subject)
+                TEST_SUBJECT="$2"
+                shift 2
+                ;;
+            --ssl-verify)
+                SSL_VERIFY="true"
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# Load Schema Registry configuration
+load_sr_config() {
+    # Try to load from environment variables first
+    if [[ -n "$CC_SR_HOST" ]]; then
+        SR_URL="https://$CC_SR_HOST"
+    fi
+    
+    if [[ -n "$CC_SR_API_KEY" ]]; then
+        SR_API_KEY="$CC_SR_API_KEY"
+    fi
+    
+    if [[ -n "$CC_SR_API_SECRET" ]]; then
+        SR_API_SECRET="$CC_SR_API_SECRET"
+    fi
+    
+    # Validate required parameters
+    if [[ -z "$SR_URL" ]]; then
+        error "Schema Registry URL is required. Use -u/--url or set CC_SR_HOST"
+        return 1
+    fi
+    
+    if [[ -z "$SR_API_KEY" ]]; then
+        error "API key is required. Use -k/--api-key or set CC_SR_API_KEY"
+        return 1
+    fi
+    
+    if [[ -z "$SR_API_SECRET" ]]; then
+        error "API secret is required. Use -s/--api-secret or set CC_SR_API_SECRET"
+        return 1
+    fi
+    
+    debug "Using Schema Registry URL: $SR_URL"
+    debug "Using API Key: ${SR_API_KEY:0:8}..."
+    
+    return 0
+}
+
+# Basic connectivity test
+test_basic_connectivity() {
+    progress "Testing basic Schema Registry connectivity"
+    
+    local response
+    local http_code
+    local body
+    
+    response=$(curl -s -w "%{http_code}" \
+        -u "${SR_API_KEY}:${SR_API_SECRET}" \
+        -H "Content-Type: application/json" \
+        --max-time "$TIMEOUT" \
+        "${SR_URL}/config" 2>/dev/null)
+    
+    http_code="${response: -3}"
+    body="${response%???}"
+    
+    case $http_code in
+        200)
+            success "Schema Registry is accessible"
+            if is_verbose; then
+                info "Config response: $body"
+            fi
+            return 0
+            ;;
+        401)
+            error "Authentication failed (401) - Check your API key and secret"
+            return 1
+            ;;
+        403)
+            error "Access forbidden (403) - Check API key permissions"
+            return 1
+            ;;
+        000)
+            error "Connection failed - Check URL and network connectivity"
+            return 1
+            ;;
+        *)
+            error "HTTP $http_code - $body"
+            return 1
+            ;;
+    esac
+}
+
+# Get subjects list
+get_subjects() {
+    local response
+    response=$(curl -s \
+        -u "${SR_API_KEY}:${SR_API_SECRET}" \
+        -H "Content-Type: application/json" \
+        --max-time "$TIMEOUT" \
+        "${SR_URL}/subjects" 2>/dev/null)
+    
+    if [[ $? -eq 0 ]]; then
+        echo "$response"
+    else
+        echo "[]"
+    fi
+}
+
+# Get schema IDs
+get_schema_ids() {
+    local response
+    response=$(curl -s \
+        -u "${SR_API_KEY}:${SR_API_SECRET}" \
+        -H "Content-Type: application/json" \
+        --max-time "$TIMEOUT" \
+        "${SR_URL}/schemas/ids" 2>/dev/null)
+    
+    if [[ $? -eq 0 ]]; then
+        echo "$response"
+    else
+        echo "[]"
+    fi
+}
+
+# Get Schema Registry mode
+get_sr_mode() {
+    local response
+    response=$(curl -s \
+        -u "${SR_API_KEY}:${SR_API_SECRET}" \
+        -H "Content-Type: application/json" \
+        --max-time "$TIMEOUT" \
+        "${SR_URL}/mode" 2>/dev/null)
+    
+    if [[ $? -eq 0 ]]; then
+        echo "$response"
+    else
+        echo '{"mode":"UNKNOWN"}'
+    fi
+}
+
+# Test specific subject
+test_subject() {
+    local subject="$1"
+    
+    progress "Testing subject: $subject"
+    
+    local response
+    response=$(curl -s -w "%{http_code}" \
+        -u "${SR_API_KEY}:${SR_API_SECRET}" \
+        -H "Content-Type: application/json" \
+        --max-time "$TIMEOUT" \
+        "${SR_URL}/subjects/${subject}/versions/latest" 2>/dev/null)
+    
+    local http_code="${response: -3}"
+    local body="${response%???}"
+    
+    case $http_code in
+        200)
+            success "Subject '$subject' found"
+            if is_verbose; then
+                info "Latest schema: $body"
+            fi
+            return 0
+            ;;
+        404)
+            warning "Subject '$subject' not found"
+            return 1
+            ;;
+        *)
+            error "Failed to get subject '$subject': HTTP $http_code"
+            return 1
+            ;;
+    esac
+}
+
+# SSL/TLS verification test
+test_ssl_verification() {
+    progress "Testing SSL/TLS verification"
+    
+    local ssl_info
+    ssl_info=$(curl -s \
+        -u "${SR_API_KEY}:${SR_API_SECRET}" \
+        -H "Content-Type: application/json" \
+        --verbose \
+        --cert-status \
+        "${SR_URL}/config" 2>&1 | grep -E "(SSL|TLS|certificate|Server certificate)")
+    
+    if [[ -n "$ssl_info" ]]; then
+        success "SSL/TLS information retrieved"
+        if is_verbose; then
+            echo "$ssl_info"
+        fi
+    else
+        warning "No SSL/TLS information available"
+    fi
+}
+
+# Run full diagnostics
+run_diagnostics() {
+    header "Schema Registry Diagnostics" "🔍"
+    
+    local auth="${SR_API_KEY}:${SR_API_SECRET}"
+    local base_curl="curl -s -u $auth -H Content-Type:application/json --max-time $TIMEOUT"
+    
+    # Test endpoints
+    local endpoints=("config" "subjects" "mode" "schemas/ids")
+    local results=()
+    
+    for endpoint in "${endpoints[@]}"; do
+        if $base_curl "${SR_URL}/${endpoint}" >/dev/null 2>&1; then
+            results+=("${endpoint}:✅")
+        else
+            results+=("${endpoint}:❌")
+        fi
+    done
+    
+    # Get statistics
+    local subjects
+    local schema_ids
+    local mode
+    
+    subjects=$(get_subjects)
+    schema_ids=$(get_schema_ids)
+    mode=$(get_sr_mode)
+    
+    local subject_count=0
+    local schema_count=0
+    local sr_mode="UNKNOWN"
+    
+    if command_exists jq; then
+        subject_count=$(echo "$subjects" | jq 'length' 2>/dev/null || echo "0")
+        schema_count=$(echo "$schema_ids" | jq 'length' 2>/dev/null || echo "0")
+        sr_mode=$(echo "$mode" | jq -r '.mode' 2>/dev/null || echo "UNKNOWN")
+    fi
+    
+    # Display results
+    display_key_value \
+        "URL=$SR_URL" \
+        "Mode=$sr_mode" \
+        "Subjects=$subject_count" \
+        "Schemas=$schema_count"
+    
+    echo
+    info "Endpoint Tests:"
+    for result in "${results[@]}"; do
+        local endpoint="${result%:*}"
+        local status="${result#*:}"
+        printf "  %-15s %s\n" "$endpoint" "$status"
+    done
+}
+
+# Output results in different formats
+output_results() {
+    local format="$1"
+    local results="$2"
+    
+    case "$(echo "$format" | tr '[:upper:]' '[:lower:]')" in
+        json)
+            echo "$results" | jq . 2>/dev/null || echo "$results"
+            ;;
+        csv)
+            echo "endpoint,status,response_time_ms,details"
+            echo "$results" | jq -r '.[] | [.endpoint, .status, .response_time, .details] | @csv' 2>/dev/null
+            ;;
+        table|*)
+            # Default table output handled by display functions
+            ;;
+    esac
+}
+
+# Main function
+main() {
+    # Initialize
+    init_common
+    
+    # Parse arguments
+    parse_args "$@"
+    
+    # Set defaults
+    OUTPUT_FORMAT="${OUTPUT_FORMAT:-$DEFAULT_OUTPUT_FORMAT}"
+    TIMEOUT="${TIMEOUT:-$DEFAULT_TIMEOUT}"
+    RUN_DIAGNOSTICS="${RUN_DIAGNOSTICS:-false}"
+    SSL_VERIFY="${SSL_VERIFY:-false}"
+    
+    # Show header
+    if ! is_quiet; then
+        header "$SCRIPT_DESCRIPTION" "🔍"
+    fi
+    
+    # Load and validate configuration
+    if ! init_config; then
+        exit 1
+    fi
+    
+    # Load Schema Registry configuration
+    if ! load_sr_config; then
+        exit 1
+    fi
+    
+    # Check prerequisites
+    if ! command_exists curl; then
+        error "curl is required but not installed"
+        exit 1
+    fi
+    
+    # Run basic connectivity test
+    if ! test_basic_connectivity; then
+        exit 1
+    fi
+    
+    # Run diagnostics if requested
+    if [[ "$RUN_DIAGNOSTICS" == "true" ]]; then
+        echo
+        run_diagnostics
+    fi
+    
+    # Test specific subject if provided
+    if [[ -n "$TEST_SUBJECT" ]]; then
+        echo
+        test_subject "$TEST_SUBJECT"
+    fi
+    
+    # Run SSL verification if requested
+    if [[ "$SSL_VERIFY" == "true" ]]; then
+        echo
+        test_ssl_verification
+    fi
+    
+    success "Schema Registry validation completed successfully"
+}
+
+# Run main function
+main "$@"

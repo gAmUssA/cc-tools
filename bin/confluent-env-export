@@ -1,0 +1,649 @@
+#!/bin/bash
+# confluent-env-export - Automated Confluent Cloud environment setup and .env generation
+
+# Get script directory and source shared libraries
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+
+source "$LIB_DIR/common.sh"
+source "$LIB_DIR/config.sh"
+source "$LIB_DIR/validation.sh"
+source "$LIB_DIR/output.sh"
+
+# Script metadata
+SCRIPT_NAME="confluent-env-export"
+SCRIPT_VERSION="1.0.0"
+SCRIPT_DESCRIPTION="Automated Confluent Cloud environment setup and .env generation"
+
+# Default values
+DEFAULT_ENV_FILE=".env"
+
+# Usage function
+usage() {
+    cat << EOF
+${BLUE}${GEAR} $SCRIPT_NAME v$SCRIPT_VERSION${RESET}
+$SCRIPT_DESCRIPTION
+
+${YELLOW}Usage:${RESET}
+  $SCRIPT_NAME [OPTIONS]
+
+${YELLOW}Options:${RESET}
+  -e, --env-file FILE         Output .env file path (default: .env)
+  -f, --force                 Overwrite existing .env file
+  -q, --quiet                 Suppress non-essential output
+  -v, --verbose               Increase output verbosity
+  -n, --dry-run              Show what would be generated without creating files
+  --create-keys              Automatically create missing API keys
+  --skip-sr                  Skip Schema Registry setup
+  -h, --help                 Show this help message
+
+${YELLOW}Examples:${RESET}
+  $SCRIPT_NAME                           # Interactive environment setup
+  $SCRIPT_NAME --create-keys             # Auto-create missing keys
+  $SCRIPT_NAME -f                        # Force overwrite existing .env
+  $SCRIPT_NAME --dry-run                 # Preview without creating files
+
+${YELLOW}Workflow:${RESET}
+  1. Check Confluent CLI authentication
+  2. List and select environment
+  3. Discover Kafka cluster and Schema Registry
+  4. Check/create API keys as needed
+  5. Generate .env file with all configuration
+
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -e|--env-file)
+                ENV_FILE="$2"
+                shift 2
+                ;;
+            -f|--force)
+                FORCE_OVERWRITE="true"
+                shift
+                ;;
+            -q|--quiet)
+                CC_QUIET="true"
+                shift
+                ;;
+            -v|--verbose)
+                CC_VERBOSE="true"
+                shift
+                ;;
+            -n|--dry-run)
+                CC_DRY_RUN="true"
+                shift
+                ;;
+            --create-keys)
+                CREATE_KEYS="true"
+                shift
+                ;;
+            --skip-sr)
+                SKIP_SR="true"
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# Check if user is logged in
+check_login() {
+    progress "Checking Confluent CLI authentication"
+    
+    if ! check_confluent_auth; then
+        error "Not logged in to Confluent Cloud"
+        info "Please run: confluent login --save"
+        return 1
+    fi
+    
+    success "Logged in successfully"
+    return 0
+}
+
+# List and select environment
+select_environment() {
+    progress "Discovering available environments"
+    
+    local env_output
+    if ! env_output=$(confluent environment list -o json 2>/dev/null); then
+        error "Failed to list environments"
+        return 1
+    fi
+    
+    local env_count=$(echo "$env_output" | jq 'length')
+    if [[ "$env_count" -eq 0 ]]; then
+        error "No environments found"
+        return 1
+    fi
+    
+    # If only one environment, use it automatically
+    if [[ "$env_count" -eq 1 ]]; then
+        SELECTED_ENV_ID=$(echo "$env_output" | jq -r '.[0].id')
+        SELECTED_ENV_NAME=$(echo "$env_output" | jq -r '.[0].name')
+        info "Using single environment: $SELECTED_ENV_NAME ($SELECTED_ENV_ID)"
+        return 0
+    fi
+    
+    # Multiple environments - show selection menu
+    echo -e "${BLUE}${SEARCH} Available environments:${RESET}"
+    
+    local index=1
+    echo "$env_output" | jq -r '.[] | @json' | while read -r env_line; do
+        local env_id=$(echo "$env_line" | jq -r '.id')
+        local env_name=$(echo "$env_line" | jq -r '.name')
+        local governance=$(echo "$env_line" | jq -r '.stream_governance_package // "None"')
+        
+        printf "  ${CYAN}%d)${RESET} %s (${BLUE}%s${RESET}) - %s\n" \
+            "$index" "$env_name" "$env_id" "$governance"
+        ((index++))
+    done
+    
+    echo
+    while true; do
+        read -p "$(echo -e "${YELLOW}Select environment [1-$env_count]:${RESET} ")" choice
+        
+        if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && [[ $choice -le $env_count ]]; then
+            local selected_env=$(echo "$env_output" | jq -r ".[$((choice-1))]")
+            SELECTED_ENV_ID=$(echo "$selected_env" | jq -r '.id')
+            SELECTED_ENV_NAME=$(echo "$selected_env" | jq -r '.name')
+            
+            success "Selected environment: $SELECTED_ENV_NAME ($SELECTED_ENV_ID)"
+            break
+        else
+            warning "Invalid choice. Please enter a number between 1 and $env_count"
+        fi
+    done
+}
+
+# Use selected environment
+use_environment() {
+    progress "Switching to environment: $SELECTED_ENV_NAME"
+    
+    if ! confluent environment use "$SELECTED_ENV_ID" >/dev/null 2>&1; then
+        error "Failed to switch to environment: $SELECTED_ENV_ID"
+        return 1
+    fi
+    
+    success "Using environment: $SELECTED_ENV_NAME"
+}
+
+# Discover Kafka cluster
+discover_kafka_cluster() {
+    progress "Checking Kafka cluster"
+    
+    local cluster_output
+    if ! cluster_output=$(confluent kafka cluster list -o json 2>/dev/null); then
+        error "Failed to list Kafka clusters"
+        return 1
+    fi
+    
+    local cluster_count=$(echo "$cluster_output" | jq 'length')
+    if [[ "$cluster_count" -eq 0 ]]; then
+        error "No Kafka clusters found in environment: $SELECTED_ENV_NAME"
+        return 1
+    fi
+    
+    # Use first/current cluster
+    local cluster_info=$(echo "$cluster_output" | jq -r '.[0]')
+    KAFKA_CLUSTER_ID=$(echo "$cluster_info" | jq -r '.id')
+    KAFKA_CLUSTER_NAME=$(echo "$cluster_info" | jq -r '.name')
+    KAFKA_ENDPOINT=$(echo "$cluster_info" | jq -r '.endpoint')
+    KAFKA_REGION=$(echo "$cluster_info" | jq -r '.region')
+    KAFKA_CLOUD=$(echo "$cluster_info" | jq -r '.cloud')
+    
+    success "Found Kafka cluster: $KAFKA_CLUSTER_NAME ($KAFKA_CLUSTER_ID)"
+    debug "Endpoint: $KAFKA_ENDPOINT"
+    debug "Region: $KAFKA_REGION, Cloud: $KAFKA_CLOUD"
+}
+
+# Check for existing Kafka API keys
+check_kafka_api_keys() {
+    progress "Checking API keys for Kafka cluster"
+    
+    local keys_output
+    if ! keys_output=$(confluent api-key list --resource "$KAFKA_CLUSTER_ID" -o json 2>/dev/null); then
+        error "Failed to list API keys"
+        return 1
+    fi
+    
+    # Find Kafka keys for this cluster
+    local kafka_keys=$(echo "$keys_output" | jq --arg cluster_id "$KAFKA_CLUSTER_ID" '
+        map(select(.resource_type == "kafka" and .resource == $cluster_id))')
+    
+    local kafka_key_count=$(echo "$kafka_keys" | jq 'length')
+    
+    if [[ "$kafka_key_count" -eq 0 ]]; then
+        warning "No API keys found for Kafka cluster: $KAFKA_CLUSTER_ID"
+        
+        if [[ "$CREATE_KEYS" == "true" ]] || confirm "Create new Kafka API key?"; then
+            create_kafka_api_key
+        else
+            error "Kafka API key required for configuration"
+            return 1
+        fi
+    else
+        # Use first available key
+        local key_info=$(echo "$kafka_keys" | jq -r '.[0]')
+        KAFKA_API_KEY=$(echo "$key_info" | jq -r '.key')
+        local key_description=$(echo "$key_info" | jq -r '.description // "No description"')
+        
+        success "Using existing Kafka API key: $KAFKA_API_KEY"
+        debug "Key description: $key_description"
+        warning "API secret cannot be retrieved from existing keys"
+        
+        if [[ "$CREATE_KEYS" == "true" ]] || confirm "Create new Kafka API key to get secret?"; then
+            create_kafka_api_key
+        else
+            KAFKA_API_SECRET="<replace-with-your-kafka-api-secret>"
+        fi
+    fi
+}
+
+# Create Kafka API key
+create_kafka_api_key() {
+    progress "Creating Kafka API key"
+    
+    local description="Created by $SCRIPT_NAME on $(date) for $KAFKA_CLUSTER_NAME"
+    
+    if is_dry_run; then
+        info "DRY RUN: Would create Kafka API key for cluster: $KAFKA_CLUSTER_ID"
+        KAFKA_API_KEY="DRY-RUN-KEY"
+        KAFKA_API_SECRET="DRY-RUN-SECRET"
+        return 0
+    fi
+    
+    local key_output
+    if ! key_output=$(confluent api-key create --resource "$KAFKA_CLUSTER_ID" --description "$description" 2>/dev/null); then
+        error "Failed to create Kafka API key"
+        return 1
+    fi
+    
+    # Parse key and secret from output
+    KAFKA_API_KEY=$(echo "$key_output" | grep "| API Key" | awk -F'|' '{print $3}' | tr -d ' ')
+    KAFKA_API_SECRET=$(echo "$key_output" | grep "| API Secret" | awk -F'|' '{print $3}' | tr -d ' ')
+    
+    if [[ -z "$KAFKA_API_KEY" || -z "$KAFKA_API_SECRET" ]]; then
+        error "Failed to parse API key from output"
+        return 1
+    fi
+    
+    success "Created Kafka API key: $KAFKA_API_KEY"
+}
+
+# Check for Cloud API keys
+check_cloud_api_keys() {
+    progress "Checking Cloud API keys"
+    
+    local keys_output
+    if ! keys_output=$(confluent api-key list -o json 2>/dev/null); then
+        warning "Failed to list API keys for Cloud"
+        return 0
+    fi
+    
+    # Find Cloud keys (no resource specified)
+    local cloud_keys=$(echo "$keys_output" | jq '
+        map(select(.resource_type == "cloud" and (.resource == null or .resource == "")))')
+    
+    local cloud_key_count=$(echo "$cloud_keys" | jq 'length')
+    
+    if [[ "$cloud_key_count" -eq 0 ]]; then
+        info "No Cloud API keys found"
+        
+        if [[ "$CREATE_KEYS" == "true" ]] || confirm "Create Cloud API key?"; then
+            create_cloud_api_key
+        else
+            info "Skipping Cloud API key configuration"
+        fi
+    else
+        # Use first available key
+        local key_info=$(echo "$cloud_keys" | jq -r '.[0]')
+        CLOUD_API_KEY=$(echo "$key_info" | jq -r '.key')
+        
+        success "Using existing Cloud API key: $CLOUD_API_KEY"
+        warning "API secret cannot be retrieved from existing keys"
+        
+        if [[ "$CREATE_KEYS" == "true" ]] || confirm "Create new Cloud API key to get secret?"; then
+            create_cloud_api_key
+        else
+            CLOUD_API_SECRET="<replace-with-your-cloud-api-secret>"
+        fi
+    fi
+}
+
+# Create Cloud API key
+create_cloud_api_key() {
+    progress "Creating Cloud API key"
+    
+    local description="Created by $SCRIPT_NAME on $(date) for Cloud access"
+    
+    if is_dry_run; then
+        info "DRY RUN: Would create Cloud API key"
+        CLOUD_API_KEY="DRY-RUN-CLOUD-KEY"
+        CLOUD_API_SECRET="DRY-RUN-CLOUD-SECRET"
+        return 0
+    fi
+    
+    local key_output
+    if ! key_output=$(confluent api-key create --resource cloud --description "$description" 2>/dev/null); then
+        warning "Failed to create Cloud API key"
+        return 0
+    fi
+    
+    # Parse key and secret from output
+    CLOUD_API_KEY=$(echo "$key_output" | grep "| API Key" | awk -F'|' '{print $3}' | tr -d ' ')
+    CLOUD_API_SECRET=$(echo "$key_output" | grep "| API Secret" | awk -F'|' '{print $3}' | tr -d ' ')
+    
+    if [[ -n "$CLOUD_API_KEY" && -n "$CLOUD_API_SECRET" ]]; then
+        success "Created Cloud API key: $CLOUD_API_KEY"
+    else
+        warning "Failed to parse Cloud API key"
+    fi
+}
+
+# Discover Schema Registry
+discover_schema_registry() {
+    if [[ "$SKIP_SR" == "true" ]]; then
+        info "Skipping Schema Registry setup"
+        return 0
+    fi
+    
+    progress "Checking Schema Registry"
+    
+    # Try to get Schema Registry cluster info
+    local sr_output
+    if sr_output=$(confluent schema-registry cluster describe -o json 2>/dev/null); then
+        SR_CLUSTER_ID=$(echo "$sr_output" | jq -r '.cluster // empty')
+        SR_ENDPOINT=$(echo "$sr_output" | jq -r '.endpoint_url // empty')
+        SR_NAME=$(echo "$sr_output" | jq -r '.name // "Schema Registry"')
+        SR_PACKAGE=$(echo "$sr_output" | jq -r '.package // empty')
+        
+        if [[ -n "$SR_CLUSTER_ID" && -n "$SR_ENDPOINT" ]]; then
+            success "Found Schema Registry: $SR_NAME ($SR_CLUSTER_ID)"
+            debug "Endpoint: $SR_ENDPOINT"
+            debug "Package: $SR_PACKAGE"
+            check_sr_api_keys
+        else
+            warning "Schema Registry cluster ID or endpoint not found"
+            debug "Raw output: $sr_output"
+        fi
+    else
+        warning "Schema Registry not available in this environment"
+    fi
+}
+
+# Check Schema Registry API keys
+check_sr_api_keys() {
+    progress "Checking Schema Registry API keys"
+    
+    local keys_output
+    if ! keys_output=$(confluent api-key list --resource "$SR_CLUSTER_ID" -o json 2>/dev/null); then
+        warning "Failed to list API keys for Schema Registry"
+        return 0
+    fi
+    
+    # Find SR keys for this specific cluster
+    local sr_keys=$(echo "$keys_output" | jq --arg cluster_id "$SR_CLUSTER_ID" '
+        map(select(.resource_type == "schema-registry" and .resource == $cluster_id))')
+    
+    local sr_key_count=$(echo "$sr_keys" | jq 'length')
+    
+    if [[ "$sr_key_count" -eq 0 ]]; then
+        warning "No Schema Registry API keys found for cluster: $SR_CLUSTER_ID"
+        
+        if [[ "$CREATE_KEYS" == "true" ]] || confirm "Create Schema Registry API key?"; then
+            create_sr_api_key
+        else
+            info "Skipping Schema Registry configuration"
+        fi
+    else
+        # Use first available key
+        local key_info=$(echo "$sr_keys" | jq -r '.[0]')
+        SR_API_KEY=$(echo "$key_info" | jq -r '.key')
+        
+        success "Using existing Schema Registry API key: $SR_API_KEY"
+        warning "API secret cannot be retrieved from existing keys"
+        
+        if [[ "$CREATE_KEYS" == "true" ]] || confirm "Create new Schema Registry API key to get secret?"; then
+            create_sr_api_key
+        else
+            SR_API_SECRET="<replace-with-your-sr-api-secret>"
+        fi
+    fi
+}
+
+# Create Schema Registry API key
+create_sr_api_key() {
+    progress "Creating Schema Registry API key"
+    
+    local description="Created by $SCRIPT_NAME on $(date) for Schema Registry"
+    
+    if is_dry_run; then
+        info "DRY RUN: Would create Schema Registry API key"
+        SR_API_KEY="DRY-RUN-SR-KEY"
+        SR_API_SECRET="DRY-RUN-SR-SECRET"
+        return 0
+    fi
+    
+    local key_output
+    if ! key_output=$(confluent api-key create --resource "$SR_CLUSTER_ID" --description "$description" 2>/dev/null); then
+        warning "Failed to create Schema Registry API key"
+        return 0
+    fi
+    
+    # Parse key and secret from output
+    SR_API_KEY=$(echo "$key_output" | grep "| API Key" | awk -F'|' '{print $3}' | tr -d ' ')
+    SR_API_SECRET=$(echo "$key_output" | grep "| API Secret" | awk -F'|' '{print $3}' | tr -d ' ')
+    
+    if [[ -n "$SR_API_KEY" && -n "$SR_API_SECRET" ]]; then
+        success "Created Schema Registry API key: $SR_API_KEY"
+    else
+        warning "Failed to parse Schema Registry API key"
+    fi
+}
+
+# Generate .env file
+generate_env_file() {
+    local env_file="$1"
+    
+    progress "Writing .env file"
+    
+    if [[ -f "$env_file" && "$FORCE_OVERWRITE" != "true" ]]; then
+        if ! confirm "File $env_file exists. Overwrite?"; then
+            info "Keeping existing .env file"
+            return 0
+        fi
+    fi
+    
+    if is_dry_run; then
+        info "DRY RUN: Would create $env_file with:"
+        show_env_preview
+        return 0
+    fi
+    
+    cat > "$env_file" << EOF
+# Generated by $SCRIPT_NAME on $(date)
+# Confluent Cloud Environment Configuration - CC_ prefix format
+
+# Environment Information
+export CC_ENV=$SELECTED_ENV_ID
+export CC_ENV_NAME=$SELECTED_ENV_NAME
+
+# Kafka Cluster Configuration
+export CC_KAFKA_CLUSTER=$KAFKA_CLUSTER_ID
+export CC_KAFKA_BROKER=${KAFKA_ENDPOINT#SASL_SSL://}
+export CC_REGION=$KAFKA_REGION
+export CC_CLOUD=$KAFKA_CLOUD
+
+# Kafka API Credentials
+export CC_KC_API_KEY=$KAFKA_API_KEY
+export CC_KC_API_SECRET=$KAFKA_API_SECRET
+
+EOF
+
+    # Add Schema Registry if available
+    if [[ -n "$SR_CLUSTER_ID" && -n "$SR_ENDPOINT" ]]; then
+        cat >> "$env_file" << EOF
+# Schema Registry Configuration
+export CC_SR_ID=$SR_CLUSTER_ID
+export CC_SR_HOST=${SR_ENDPOINT#https://}
+export CC_SR_API_KEY=${SR_API_KEY:-}
+export CC_SR_API_SECRET=${SR_API_SECRET:-}
+
+EOF
+    fi
+    
+    # Add Cloud API key if available
+    if [[ -n "$CLOUD_API_KEY" && -n "$CLOUD_API_SECRET" ]]; then
+        cat >> "$env_file" << EOF
+# Cloud API Credentials
+export CC_CLOUD_API_KEY=$CLOUD_API_KEY
+export CC_CLOUD_API_SECRET=$CLOUD_API_SECRET
+
+EOF
+    fi
+    
+    # Add legacy format for backward compatibility
+    cat >> "$env_file" << EOF
+# Legacy format for backward compatibility
+export CONFLUENT_ENVIRONMENT_ID=\$CC_ENV
+export CONFLUENT_CLUSTER_ID=\$CC_KAFKA_CLUSTER
+export CONFLUENT_BOOTSTRAP_SERVERS=\$CC_KAFKA_BROKER
+export CONFLUENT_REGION=\$CC_REGION
+export CONFLUENT_CLOUD=\$CC_CLOUD
+export CONFLUENT_CLOUD_API_KEY=\$CC_KC_API_KEY
+export CONFLUENT_CLOUD_API_SECRET=\$CC_KC_API_SECRET
+EOF
+
+    if [[ -n "$SR_CLUSTER_ID" ]]; then
+        cat >> "$env_file" << EOF
+export CONFLUENT_SCHEMA_REGISTRY_URL=https://\$CC_SR_HOST
+export CONFLUENT_SCHEMA_REGISTRY_API_KEY=\$CC_SR_API_KEY
+export CONFLUENT_SCHEMA_REGISTRY_API_SECRET=\$CC_SR_API_SECRET
+EOF
+    fi
+    
+    cat >> "$env_file" << EOF
+
+# Optional: Custom Configuration Directory
+# export CC_CONFIG_DIR=/path/to/custom/config/dir
+
+# Optional: Default Output Format (json|yaml|table|csv)
+# export CC_DEFAULT_OUTPUT_FORMAT=table
+
+# Optional: Notification Settings
+# export CC_WEBHOOK_URL=https://hooks.slack.com/services/your/webhook/url
+# export CC_NOTIFICATION_EMAIL=admin@yourcompany.com
+
+EOF
+    
+    success "Generated .env successfully!"
+    
+    # Show next steps
+    echo
+    header "Next Steps" "$ROCKET"
+    info "Load the environment variables:"
+    echo -e "  ${CYAN}source .env${RESET}"
+    echo
+    info "Verify configuration:"
+    echo -e "  ${CYAN}echo \$CC_KAFKA_BROKER${RESET}"
+    echo -e "  ${CYAN}echo \$CONFLUENT_BOOTSTRAP_SERVERS${RESET}"
+    echo
+    info "Test with utilities:"
+    echo -e "  ${CYAN}./bin/cc-key-list${RESET}"
+    echo -e "  ${CYAN}gmake generate-props${RESET}"
+}
+
+# Show environment preview
+show_env_preview() {
+    echo -e "${CYAN}Environment:${RESET} $SELECTED_ENV_NAME ($SELECTED_ENV_ID)"
+    echo -e "${CYAN}Kafka Cluster:${RESET} $KAFKA_CLUSTER_NAME ($KAFKA_CLUSTER_ID)"
+    echo -e "${CYAN}Bootstrap Servers:${RESET} ${KAFKA_ENDPOINT#SASL_SSL://}"
+    echo -e "${CYAN}Region:${RESET} $KAFKA_REGION ($KAFKA_CLOUD)"
+    echo -e "${CYAN}Kafka API Key:${RESET} $KAFKA_API_KEY"
+    
+    if [[ -n "$SR_CLUSTER_ID" ]]; then
+        echo -e "${CYAN}Schema Registry:${RESET} $SR_NAME ($SR_CLUSTER_ID)"
+        echo -e "${CYAN}SR Endpoint:${RESET} $SR_ENDPOINT"
+        echo -e "${CYAN}SR Package:${RESET} $SR_PACKAGE"
+        if [[ -n "$SR_API_KEY" ]]; then
+            echo -e "${CYAN}SR API Key:${RESET} $SR_API_KEY"
+        fi
+    fi
+}
+
+# Main function
+main() {
+    # Initialize
+    init_common
+    
+    # Parse arguments
+    parse_args "$@"
+    
+    # Set defaults
+    ENV_FILE="${ENV_FILE:-$DEFAULT_ENV_FILE}"
+    FORCE_OVERWRITE="${FORCE_OVERWRITE:-false}"
+    CREATE_KEYS="${CREATE_KEYS:-false}"
+    SKIP_SR="${SKIP_SR:-false}"
+    
+    # Show header
+    if ! is_quiet; then
+        header "$SCRIPT_DESCRIPTION" "$GEAR"
+    fi
+    
+    # Check authentication
+    if ! check_login; then
+        exit 1
+    fi
+    
+    # Select environment
+    if ! select_environment; then
+        exit 1
+    fi
+    
+    # Use selected environment
+    if ! use_environment; then
+        exit 1
+    fi
+    
+    # Discover Kafka cluster
+    if ! discover_kafka_cluster; then
+        exit 1
+    fi
+    
+    # Check/create Kafka API keys
+    if ! check_kafka_api_keys; then
+        exit 1
+    fi
+    
+    # Check Cloud API keys
+    check_cloud_api_keys
+    
+    # Discover Schema Registry
+    discover_schema_registry
+    
+    # Generate .env file
+    if ! generate_env_file "$ENV_FILE"; then
+        exit 1
+    fi
+    
+    if ! is_quiet && ! is_dry_run; then
+        echo
+        success "Environment setup completed successfully!"
+        info "Your Confluent Cloud environment is ready to use."
+    fi
+}
+
+# Run main function
+main "$@"

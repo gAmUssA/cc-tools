@@ -1,0 +1,113 @@
+# Windsurf Rules for Confluent Cloud Tools Project
+
+## Task List Management
+
+### Task Tracking Rules
+- **Primary Task File**: Use `docs/tasks.md` as the single source of truth for project tasks
+- **Task Format**: All tasks must use checkbox format `[ ]` for incomplete, `[x]` for complete
+- **Progress Tracking**: Update task status immediately upon completion, not in batches
+- **Sub-task Creation**: Break down complex tasks into smaller sub-tasks when needed
+- **Documentation**: Include relevant commit hashes or file references when marking tasks complete
+
+### Task List Workflow
+```bash
+# When starting work on a task
+1. Open docs/tasks.md
+2. Locate the relevant task
+3. Mark as in-progress if needed (add comment or timestamp)
+4. Complete the work
+5. Mark task as complete [x] immediately
+6. Add any relevant notes or references
+```
+
+### Task Organization
+- **Phase-based Structure**: Tasks are organized by implementation phases
+- **Dependency Tracking**: Ensure prerequisite tasks are completed before dependent tasks
+- **Priority Indicators**: Focus on Phase 1 (Foundation) before moving to later phases
+- **Cross-references**: Link related tasks across different phases when applicable
+
+### Task Completion Guidelines
+- Mark tasks complete `[x]` only after thorough testing
+- Update the file regularly to track progress
+- Add sub-tasks if needed for complex items
+- Include relevant commit hashes for completed tasks
+- Document any deviations from the original plan
+
+## Development Standards
+
+### File Structure Adherence
+- Follow the established directory structure in `docs/plan.md`
+- Place executables in `bin/` directory
+- Place shared libraries in `lib/` directory
+- Place templates in `templates/` directory
+- Place tests in `tests/` directory
+
+### Makefile Standards
+- Always use the required preamble from user global rules
+- Use `.RECIPEPREFIX = >` instead of tabs
+- Include emoji and color definitions
+- Follow GNU Make 4.0+ best practices
+- Implement all required targets: help, install, bootstrap, test, clean
+
+### Shell Script Standards
+- Use `#!/bin/bash` shebang
+- Source shared libraries from `lib/` directory
+- Implement consistent error handling with colors and emojis
+- Follow the established patterns in `lib/common.sh`
+- Use confluent CLI commands as building blocks
+
+### Configuration Management
+- Use `.env` as single source of truth
+- Validate all required environment variables
+- Generate configuration files from templates
+- Support multiple output formats (JSON, CSV, YAML, table)
+
+## Quality Assurance
+
+### Testing Requirements
+- Write unit tests for all shared library functions
+- Create integration tests for end-to-end workflows
+- Test error conditions and edge cases
+- Achieve >90% test coverage for shared libraries
+- Use `bats` framework for structured testing
+
+### Code Review Checklist
+- [ ] Follows established file structure
+- [ ] Uses shared libraries appropriately
+- [ ] Implements proper error handling
+- [ ] Includes colored output with emojis
+- [ ] Has corresponding tests
+- [ ] Updates relevant documentation
+- [ ] Marks related tasks as complete
+
+### Documentation Standards
+- Update `docs/tasks.md` for all task completions
+- Include usage examples in utility help text
+- Document all command-line flags and options
+- Provide troubleshooting information
+- Include security best practices
+
+## Workflow Integration
+
+### Git Workflow
+- Create feature branches for each major task or phase
+- Include task references in commit messages
+- Update task list in the same commit as the implementation
+- Use descriptive commit messages with emoji prefixes
+
+### Development Cycle
+1. Review current phase tasks in `docs/tasks.md`
+2. Select next priority task
+3. Create or switch to appropriate feature branch
+4. Implement the task following established patterns
+5. Write/update tests
+6. Update documentation
+7. Mark task as complete `[x]` in `docs/tasks.md`
+8. Commit changes with task reference
+9. Move to next task
+
+### Progress Reporting
+- Use `docs/tasks.md` completion status for progress tracking
+- Provide regular updates on phase completion
+- Identify and document any blockers or dependencies
+- Adjust timeline estimates based on actual completion rates

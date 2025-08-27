@@ -1,0 +1,533 @@
+#!/bin/bash
+# cc-key-create - Interactive API key creation utility for Confluent Cloud
+
+# Get script directory and source shared libraries
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+
+source "$LIB_DIR/common.sh"
+source "$LIB_DIR/config.sh"
+source "$LIB_DIR/validation.sh"
+source "$LIB_DIR/output.sh"
+
+# Script metadata
+SCRIPT_NAME="cc-key-create"
+SCRIPT_VERSION="1.0.0"
+SCRIPT_DESCRIPTION="Interactive API key creation utility for Confluent Cloud"
+
+# Default values
+DEFAULT_OUTPUT_FORMAT="table"
+DEFAULT_DESCRIPTION_PREFIX="Created by cc-key-create"
+
+# Usage function
+usage() {
+    cat << EOF
+${BLUE}${KEY} $SCRIPT_NAME v$SCRIPT_VERSION${RESET}
+$SCRIPT_DESCRIPTION
+
+${YELLOW}Usage:${RESET}
+  $SCRIPT_NAME [OPTIONS]
+
+${YELLOW}Options:${RESET}
+  -r, --resource RESOURCE     Resource type (kafka, schema-registry, flink, tableflow, connect)
+  -d, --description DESC      Custom description for the API key
+  -o, --output FORMAT         Output format (table, json, csv, yaml)
+  -e, --env-file FILE         Environment file path (default: .env)
+  -q, --quiet                 Suppress non-essential output
+  -v, --verbose               Increase output verbosity
+  -n, --dry-run              Show what would be done without executing
+  -f, --force                Skip confirmation prompts
+  -b, --bulk                 Create keys for multiple resources
+  -s, --store                Store keys locally after creation
+  -g, --generate-config      Generate configuration files after creation
+  -h, --help                 Show this help message
+
+${YELLOW}Examples:${RESET}
+  $SCRIPT_NAME                           # Interactive mode
+  $SCRIPT_NAME -r kafka                  # Create Kafka API key
+  $SCRIPT_NAME -r schema-registry -s     # Create SR key and store locally
+  $SCRIPT_NAME -b -g                     # Bulk create with config generation
+  $SCRIPT_NAME --dry-run                 # Preview actions without execution
+
+${YELLOW}Resource Types:${RESET}
+  kafka           Kafka cluster API key
+  schema-registry Schema Registry API key
+  flink           Flink region API key
+  tableflow       TableFlow API key
+  connect         Kafka Connect API key
+
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -r|--resource)
+                RESOURCE_TYPE="$2"
+                shift 2
+                ;;
+            -d|--description)
+                CUSTOM_DESCRIPTION="$2"
+                shift 2
+                ;;
+            -o|--output)
+                OUTPUT_FORMAT="$2"
+                shift 2
+                ;;
+            -e|--env-file)
+                CC_ENV_FILE="$2"
+                shift 2
+                ;;
+            -q|--quiet)
+                CC_QUIET="true"
+                shift
+                ;;
+            -v|--verbose)
+                CC_VERBOSE="true"
+                shift
+                ;;
+            -n|--dry-run)
+                CC_DRY_RUN="true"
+                shift
+                ;;
+            -f|--force)
+                CC_FORCE="true"
+                shift
+                ;;
+            -b|--bulk)
+                BULK_MODE="true"
+                shift
+                ;;
+            -s|--store)
+                STORE_LOCALLY="true"
+                shift
+                ;;
+            -g|--generate-config)
+                GENERATE_CONFIG="true"
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# Get resource selection interactively
+select_resource_type() {
+    if [[ -n "$RESOURCE_TYPE" ]]; then
+        return 0
+    fi
+    
+    header "Resource Type Selection" "$KEY"
+    
+    local resources=(
+        "kafka:Kafka Cluster API Key"
+        "schema-registry:Schema Registry API Key"
+        "flink:Flink Region API Key"
+        "tableflow:TableFlow API Key"
+        "connect:Kafka Connect API Key"
+    )
+    
+    echo -e "${YELLOW}Select resource type for API key creation:${RESET}"
+    echo
+    
+    local options=()
+    for i in "${!resources[@]}"; do
+        local resource="${resources[i]}"
+        local type="${resource%%:*}"
+        local desc="${resource#*:}"
+        options+=("$type")
+        echo -e "  ${CYAN}$((i+1)))${RESET} $desc"
+    done
+    echo
+    
+    while true; do
+        read -p "$(echo -e "${YELLOW}Enter choice [1-${#resources[@]}]:${RESET} ")" choice
+        
+        if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && [[ $choice -le ${#resources[@]} ]]; then
+            RESOURCE_TYPE="${options[$((choice-1))]}"
+            success "Selected resource type: $RESOURCE_TYPE"
+            break
+        else
+            warning "Invalid choice. Please enter a number between 1 and ${#resources[@]}"
+        fi
+    done
+}
+
+# Generate automatic description
+generate_description() {
+    local resource_type="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local hostname=$(hostname -s 2>/dev/null || echo "unknown")
+    local user=$(whoami 2>/dev/null || echo "unknown")
+    
+    if [[ -n "$CUSTOM_DESCRIPTION" ]]; then
+        echo "$CUSTOM_DESCRIPTION"
+    else
+        echo "$DEFAULT_DESCRIPTION_PREFIX on $timestamp by $user@$hostname for $resource_type"
+    fi
+}
+
+# Get resource ID based on type
+get_resource_id() {
+    local resource_type="$1"
+    
+    case "$resource_type" in
+        kafka)
+            echo "$CONFLUENT_CLUSTER_ID"
+            ;;
+        schema-registry)
+            if [[ -n "$CONFLUENT_SCHEMA_REGISTRY_CLUSTER_ID" ]]; then
+                echo "$CONFLUENT_SCHEMA_REGISTRY_CLUSTER_ID"
+            else
+                # Try to get SR cluster ID from URL
+                local sr_id=$(echo "$CONFLUENT_SCHEMA_REGISTRY_URL" | grep -oE 'psrc-[a-zA-Z0-9]+' || echo "")
+                if [[ -n "$sr_id" ]]; then
+                    echo "$sr_id"
+                else
+                    error "Schema Registry cluster ID not found"
+                    return 1
+                fi
+            fi
+            ;;
+        flink)
+            if [[ -n "$CONFLUENT_FLINK_REGION" ]]; then
+                echo "$CONFLUENT_FLINK_REGION"
+            else
+                error "Flink region not configured"
+                return 1
+            fi
+            ;;
+        tableflow)
+            # TableFlow uses organization-level resources
+            echo ""
+            ;;
+        connect)
+            if [[ -n "$CONFLUENT_CONNECT_CLUSTER_ID" ]]; then
+                echo "$CONFLUENT_CONNECT_CLUSTER_ID"
+            else
+                error "Kafka Connect cluster ID not configured"
+                return 1
+            fi
+            ;;
+        *)
+            error "Unknown resource type: $resource_type"
+            return 1
+            ;;
+    esac
+}
+
+# Create API key
+create_api_key() {
+    local resource_type="$1"
+    local description="$2"
+    
+    progress "Creating $resource_type API key"
+    
+    local resource_id
+    resource_id=$(get_resource_id "$resource_type")
+    if [[ $? -ne 0 ]]; then
+        return 1
+    fi
+    
+    local cmd="confluent api-key create --resource $resource_id --description \"$description\""
+    
+    if is_dry_run; then
+        info "DRY RUN: Would execute: $cmd"
+        return 0
+    fi
+    
+    local output
+    if output=$(eval "$cmd" 2>&1); then
+        success "API key created successfully"
+        
+        # Parse the output to extract key and secret
+        local api_key=$(echo "$output" | grep -oE 'API Key:\s+[A-Za-z0-9]+' | awk '{print $3}')
+        local api_secret=$(echo "$output" | grep -oE 'API Secret:\s+[A-Za-z0-9+/=]+' | awk '{print $3}')
+        
+        if [[ -n "$api_key" && -n "$api_secret" ]]; then
+            export CREATED_API_KEY="$api_key"
+            export CREATED_API_SECRET="$api_secret"
+            export CREATED_RESOURCE_TYPE="$resource_type"
+            export CREATED_RESOURCE_ID="$resource_id"
+            
+            if ! is_quiet; then
+                echo
+                display_key_value \
+                    "Resource Type=$resource_type" \
+                    "Resource ID=$resource_id" \
+                    "API Key=$api_key" \
+                    "API Secret=${api_secret:0:8}..." \
+                    "Description=$description"
+            fi
+        else
+            warning "Could not parse API key from output"
+            debug "Raw output: $output"
+        fi
+        
+        return 0
+    else
+        error "Failed to create API key: $output"
+        return 1
+    fi
+}
+
+# Store API key locally
+store_api_key() {
+    local api_key="$1"
+    local api_secret="$2"
+    local resource_type="$3"
+    
+    if [[ "$STORE_LOCALLY" != "true" ]]; then
+        return 0
+    fi
+    
+    progress "Storing API key locally"
+    
+    local cmd="confluent api-key store $api_key $api_secret --description \"Stored by $SCRIPT_NAME\""
+    
+    if is_dry_run; then
+        info "DRY RUN: Would execute: $cmd"
+        return 0
+    fi
+    
+    if eval "$cmd" >/dev/null 2>&1; then
+        success "API key stored locally"
+        return 0
+    else
+        warning "Failed to store API key locally"
+        return 1
+    fi
+}
+
+# Generate configuration files
+generate_config_files() {
+    local api_key="$1"
+    local api_secret="$2"
+    local resource_type="$3"
+    
+    if [[ "$GENERATE_CONFIG" != "true" ]]; then
+        return 0
+    fi
+    
+    progress "Generating configuration files"
+    
+    # Temporarily set the new credentials for config generation
+    local old_api_key="$CONFLUENT_CLOUD_API_KEY"
+    local old_api_secret="$CONFLUENT_CLOUD_API_SECRET"
+    
+    export CONFLUENT_CLOUD_API_KEY="$api_key"
+    export CONFLUENT_CLOUD_API_SECRET="$api_secret"
+    
+    local config_dir="configs/${resource_type}_${api_key}"
+    mkdir -p "$config_dir"
+    
+    # Generate different client configurations
+    if generate_java_properties "$config_dir/client.properties" "client"; then
+        success "Generated Java client properties"
+    fi
+    
+    if generate_python_config "$config_dir/client.env" "env"; then
+        success "Generated Python environment config"
+    fi
+    
+    if generate_nodejs_config "$config_dir/client.env" "env"; then
+        success "Generated Node.js environment config"
+    fi
+    
+    if generate_docker_config "$config_dir/docker.env"; then
+        success "Generated Docker environment config"
+    fi
+    
+    # Restore original credentials
+    export CONFLUENT_CLOUD_API_KEY="$old_api_key"
+    export CONFLUENT_CLOUD_API_SECRET="$old_api_secret"
+    
+    info "Configuration files saved to: $config_dir"
+    return 0
+}
+
+# Bulk creation mode
+bulk_create_keys() {
+    header "Bulk API Key Creation" "$KEY"
+    
+    local resource_types=("kafka" "schema-registry")
+    local created_keys=()
+    
+    # Add optional resources if configured
+    if [[ -n "$CONFLUENT_FLINK_REGION" ]]; then
+        resource_types+=("flink")
+    fi
+    
+    # TableFlow is always available (organization-level)
+    resource_types+=("tableflow")
+    
+    if [[ -n "$CONFLUENT_CONNECT_CLUSTER_ID" ]]; then
+        resource_types+=("connect")
+    fi
+    
+    info "Creating API keys for ${#resource_types[@]} resource types"
+    
+    for resource_type in "${resource_types[@]}"; do
+        echo
+        header "Creating $resource_type API Key" "$GEAR"
+        
+        local description
+        description=$(generate_description "$resource_type")
+        
+        if create_api_key "$resource_type" "$description"; then
+            if [[ -n "$CREATED_API_KEY" ]]; then
+                created_keys+=("$resource_type:$CREATED_API_KEY:$CREATED_API_SECRET")
+                
+                store_api_key "$CREATED_API_KEY" "$CREATED_API_SECRET" "$resource_type"
+                generate_config_files "$CREATED_API_KEY" "$CREATED_API_SECRET" "$resource_type"
+            fi
+        else
+            warning "Failed to create $resource_type API key, continuing with others"
+        fi
+    done
+    
+    # Summary
+    echo
+    header "Bulk Creation Summary" "$CHECK"
+    
+    if [[ ${#created_keys[@]} -gt 0 ]]; then
+        success "Successfully created ${#created_keys[@]} API keys"
+        
+        for key_info in "${created_keys[@]}"; do
+            local resource_type="${key_info%%:*}"
+            local api_key="${key_info#*:}"
+            api_key="${api_key%%:*}"
+            echo -e "  ${GREEN}${CHECK}${RESET} $resource_type: $api_key"
+        done
+    else
+        error "No API keys were created successfully"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Output results in specified format
+output_results() {
+    local api_key="$1"
+    local api_secret="$2"
+    local resource_type="$3"
+    local resource_id="$4"
+    local description="$5"
+    
+    case "${OUTPUT_FORMAT,,}" in
+        json)
+            json_object \
+                "api_key=$api_key" \
+                "api_secret=$api_secret" \
+                "resource_type=$resource_type" \
+                "resource_id=$resource_id" \
+                "description=$description" \
+                "created_at=$(date -Iseconds)"
+            ;;
+        csv)
+            echo "api_key,api_secret,resource_type,resource_id,description,created_at"
+            echo "$api_key,$api_secret,$resource_type,$resource_id,\"$description\",$(date -Iseconds)"
+            ;;
+        yaml)
+            cat << EOF
+api_key: $api_key
+api_secret: $api_secret
+resource_type: $resource_type
+resource_id: $resource_id
+description: $description
+created_at: $(date -Iseconds)
+EOF
+            ;;
+        table|*)
+            # Already displayed in create_api_key function
+            ;;
+    esac
+}
+
+# Main function
+main() {
+    # Initialize
+    init_common
+    
+    # Parse arguments
+    parse_args "$@"
+    
+    # Set defaults
+    OUTPUT_FORMAT="${OUTPUT_FORMAT:-$DEFAULT_OUTPUT_FORMAT}"
+    BULK_MODE="${BULK_MODE:-false}"
+    STORE_LOCALLY="${STORE_LOCALLY:-false}"
+    GENERATE_CONFIG="${GENERATE_CONFIG:-false}"
+    
+    # Show header
+    if ! is_quiet; then
+        header "$SCRIPT_DESCRIPTION" "$KEY"
+    fi
+    
+    # Load and validate configuration
+    if ! init_config; then
+        exit 1
+    fi
+    
+    # Check prerequisites
+    if ! check_prerequisites; then
+        exit 1
+    fi
+    
+    # Validate output format
+    if ! validate_output_format "$OUTPUT_FORMAT"; then
+        exit 1
+    fi
+    
+    # Handle bulk mode
+    if [[ "$BULK_MODE" == "true" ]]; then
+        bulk_create_keys
+        exit $?
+    fi
+    
+    # Interactive resource selection
+    select_resource_type
+    
+    # Generate description
+    local description
+    description=$(generate_description "$RESOURCE_TYPE")
+    
+    # Confirm action
+    if ! is_dry_run && ! confirm "Create $RESOURCE_TYPE API key with description: '$description'?" "y"; then
+        info "Operation cancelled"
+        exit 0
+    fi
+    
+    # Create the API key
+    if create_api_key "$RESOURCE_TYPE" "$description"; then
+        if [[ -n "$CREATED_API_KEY" ]]; then
+            # Store locally if requested
+            store_api_key "$CREATED_API_KEY" "$CREATED_API_SECRET" "$RESOURCE_TYPE"
+            
+            # Generate config files if requested
+            generate_config_files "$CREATED_API_KEY" "$CREATED_API_SECRET" "$RESOURCE_TYPE"
+            
+            # Output results in requested format
+            if [[ "$OUTPUT_FORMAT" != "table" ]]; then
+                output_results "$CREATED_API_KEY" "$CREATED_API_SECRET" "$RESOURCE_TYPE" "$CREATED_RESOURCE_ID" "$description"
+            fi
+            
+            success "API key creation completed successfully"
+        fi
+    else
+        error "API key creation failed"
+        exit 1
+    fi
+}
+
+# Run main function
+main "$@"

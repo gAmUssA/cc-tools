@@ -1,0 +1,555 @@
+#!/bin/bash
+# cc-kafka-validate - Kafka connectivity validation utility for Confluent Cloud
+
+# Get script directory and source shared libraries
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+
+source "$LIB_DIR/common.sh"
+source "$LIB_DIR/config.sh"
+source "$LIB_DIR/validation.sh"
+source "$LIB_DIR/output.sh"
+
+# Script metadata
+SCRIPT_NAME="cc-kafka-validate"
+SCRIPT_VERSION="1.0.0"
+SCRIPT_DESCRIPTION="Kafka connectivity validation utility for Confluent Cloud"
+
+# Default values
+DEFAULT_OUTPUT_FORMAT="table"
+DEFAULT_TIMEOUT=10
+DEFAULT_TEST_TOPIC="cc-connectivity-test"
+
+# Usage function
+usage() {
+    cat << EOF
+${BLUE}⚡ $SCRIPT_NAME v$SCRIPT_VERSION${RESET}
+$SCRIPT_DESCRIPTION
+
+${YELLOW}Usage:${RESET}
+  $SCRIPT_NAME [OPTIONS]
+
+${YELLOW}Options:${RESET}
+  -b, --bootstrap-servers SERVERS  Kafka bootstrap servers
+  -k, --api-key KEY               API key for authentication
+  -s, --api-secret SECRET         API secret for authentication
+  -o, --output FORMAT             Output format (table, json, csv)
+  -t, --timeout SECONDS           Connection timeout (default: $DEFAULT_TIMEOUT)
+  -e, --env-file FILE             Environment file path (default: .env)
+  -q, --quiet                     Suppress non-essential output
+  -v, --verbose                   Increase output verbosity
+  -d, --diagnostics               Run full diagnostics
+  --test-topic TOPIC              Topic for testing (default: $DEFAULT_TEST_TOPIC)
+  --ssl-check                     Check SSL certificates
+  --network-test                  Test network connectivity
+  --create-test-topic             Create test topic for validation
+  --method METHOD                 Validation method (confluent|kafka-tools|kcat|all)
+  -h, --help                     Show this help message
+
+${YELLOW}Examples:${RESET}
+  $SCRIPT_NAME                                    # Use credentials from .env
+  $SCRIPT_NAME -d                                 # Run full diagnostics
+  $SCRIPT_NAME --ssl-check                        # Check SSL certificates
+  $SCRIPT_NAME --method kcat                      # Use kcat for validation
+  $SCRIPT_NAME --create-test-topic                # Create test topic
+  $SCRIPT_NAME -b server:9092 -k KEY -s SECRET   # Manual credentials
+
+${YELLOW}Environment Variables:${RESET}
+  CC_KAFKA_BROKER                 Kafka bootstrap servers
+  CC_KC_API_KEY                   Kafka API key
+  CC_KC_API_SECRET                Kafka API secret
+
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -b|--bootstrap-servers)
+                BOOTSTRAP_SERVERS="$2"
+                shift 2
+                ;;
+            -k|--api-key)
+                KAFKA_API_KEY="$2"
+                shift 2
+                ;;
+            -s|--api-secret)
+                KAFKA_API_SECRET="$2"
+                shift 2
+                ;;
+            -o|--output)
+                OUTPUT_FORMAT="$2"
+                shift 2
+                ;;
+            -t|--timeout)
+                TIMEOUT="$2"
+                shift 2
+                ;;
+            -e|--env-file)
+                CC_ENV_FILE="$2"
+                shift 2
+                ;;
+            -q|--quiet)
+                CC_QUIET="true"
+                shift
+                ;;
+            -v|--verbose)
+                CC_VERBOSE="true"
+                shift
+                ;;
+            -d|--diagnostics)
+                RUN_DIAGNOSTICS="true"
+                shift
+                ;;
+            --test-topic)
+                TEST_TOPIC="$2"
+                shift 2
+                ;;
+            --ssl-check)
+                SSL_CHECK="true"
+                shift
+                ;;
+            --network-test)
+                NETWORK_TEST="true"
+                shift
+                ;;
+            --create-test-topic)
+                CREATE_TEST_TOPIC="true"
+                shift
+                ;;
+            --method)
+                VALIDATION_METHOD="$2"
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# Load Kafka configuration
+load_kafka_config() {
+    # Try to load from environment variables first
+    if [[ -n "$CC_KAFKA_BROKER" ]]; then
+        BOOTSTRAP_SERVERS="$CC_KAFKA_BROKER"
+    fi
+    
+    if [[ -n "$CC_KC_API_KEY" ]]; then
+        KAFKA_API_KEY="$CC_KC_API_KEY"
+    fi
+    
+    if [[ -n "$CC_KC_API_SECRET" ]]; then
+        KAFKA_API_SECRET="$CC_KC_API_SECRET"
+    fi
+    
+    # Validate required parameters
+    if [[ -z "$BOOTSTRAP_SERVERS" ]]; then
+        error "Bootstrap servers required. Use -b/--bootstrap-servers or set CC_KAFKA_BROKER"
+        return 1
+    fi
+    
+    if [[ -z "$KAFKA_API_KEY" ]]; then
+        error "API key required. Use -k/--api-key or set CC_KC_API_KEY"
+        return 1
+    fi
+    
+    if [[ -z "$KAFKA_API_SECRET" ]]; then
+        error "API secret required. Use -s/--api-secret or set CC_KC_API_SECRET"
+        return 1
+    fi
+    
+    debug "Using Bootstrap Servers: $BOOTSTRAP_SERVERS"
+    debug "Using API Key: ${KAFKA_API_KEY:0:8}..."
+    
+    return 0
+}
+
+# Create temporary client properties file
+create_client_properties() {
+    local config_file="/tmp/kafka_client_$$.properties"
+    
+    cat > "$config_file" << EOF
+bootstrap.servers=${BOOTSTRAP_SERVERS}
+security.protocol=SASL_SSL
+sasl.mechanism=PLAIN
+sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username='${KAFKA_API_KEY}' password='${KAFKA_API_SECRET}';
+request.timeout.ms=${TIMEOUT}000
+EOF
+    
+    echo "$config_file"
+}
+
+# Test with Confluent CLI
+test_confluent_cli() {
+    progress "Testing with Confluent CLI"
+    
+    if ! command_exists confluent; then
+        warning "Confluent CLI not found"
+        return 1
+    fi
+    
+    # Test basic connectivity
+    if confluent kafka topic list >/dev/null 2>&1; then
+        success "Confluent CLI connectivity test passed"
+        
+        if is_verbose; then
+            local topic_count=$(confluent kafka topic list 2>/dev/null | wc -l)
+            info "Topic count: $topic_count"
+        fi
+        return 0
+    else
+        error "Confluent CLI connectivity test failed"
+        return 1
+    fi
+}
+
+# Test with kafka-tools
+test_kafka_tools() {
+    progress "Testing with kafka-tools"
+    
+    if ! command_exists kafka-topics; then
+        warning "kafka-topics not found"
+        return 1
+    fi
+    
+    local config_file
+    config_file=$(create_client_properties)
+    
+    # Test listing topics
+    if kafka-topics --bootstrap-server "$BOOTSTRAP_SERVERS" \
+       --command-config "$config_file" \
+       --list >/dev/null 2>&1; then
+        success "kafka-tools connectivity test passed"
+        
+        if is_verbose; then
+            local topic_count=$(kafka-topics --bootstrap-server "$BOOTSTRAP_SERVERS" \
+                              --command-config "$config_file" \
+                              --list 2>/dev/null | wc -l)
+            info "Topic count: $topic_count"
+        fi
+        
+        rm -f "$config_file"
+        return 0
+    else
+        error "kafka-tools connectivity test failed"
+        rm -f "$config_file"
+        return 1
+    fi
+}
+
+# Test with kcat
+test_kcat() {
+    progress "Testing with kcat"
+    
+    if ! command_exists kcat; then
+        warning "kcat not found"
+        return 1
+    fi
+    
+    # Test metadata retrieval
+    if kcat -b "$BOOTSTRAP_SERVERS" \
+       -X security.protocol=SASL_SSL \
+       -X sasl.mechanism=PLAIN \
+       -X sasl.username="$KAFKA_API_KEY" \
+       -X sasl.password="$KAFKA_API_SECRET" \
+       -L >/dev/null 2>&1; then
+        success "kcat connectivity test passed"
+        return 0
+    else
+        error "kcat connectivity test failed"
+        return 1
+    fi
+}
+
+# Network connectivity test
+test_network_connectivity() {
+    progress "Testing network connectivity"
+    
+    local host=$(echo "$BOOTSTRAP_SERVERS" | cut -d: -f1)
+    local port=$(echo "$BOOTSTRAP_SERVERS" | cut -d: -f2)
+    
+    if timeout "$TIMEOUT" bash -c "</dev/tcp/$host/$port" 2>/dev/null; then
+        success "Network connectivity OK to $host:$port"
+        return 0
+    else
+        error "Network connectivity FAILED to $host:$port"
+        return 1
+    fi
+}
+
+# SSL certificate check
+check_ssl_certificates() {
+    progress "Checking SSL certificates"
+    
+    local host=$(echo "$BOOTSTRAP_SERVERS" | cut -d: -f1)
+    local port=$(echo "$BOOTSTRAP_SERVERS" | cut -d: -f2)
+    
+    local ssl_info
+    ssl_info=$(echo | openssl s_client -connect "$host:$port" -servername "$host" 2>/dev/null | \
+               openssl x509 -noout -issuer -subject -dates 2>/dev/null)
+    
+    if [[ -n "$ssl_info" ]]; then
+        success "SSL certificate check passed"
+        if is_verbose; then
+            echo "$ssl_info"
+        fi
+        return 0
+    else
+        error "SSL certificate check failed"
+        return 1
+    fi
+}
+
+# Create test topic
+create_test_topic() {
+    progress "Creating test topic: $TEST_TOPIC"
+    
+    if command_exists confluent; then
+        if confluent kafka topic create "$TEST_TOPIC" --partitions 1 >/dev/null 2>&1; then
+            success "Test topic created: $TEST_TOPIC"
+            return 0
+        else
+            warning "Failed to create test topic (may already exist or insufficient permissions)"
+            return 1
+        fi
+    else
+        warning "Confluent CLI not available for topic creation"
+        return 1
+    fi
+}
+
+# Delete test topic
+delete_test_topic() {
+    if command_exists confluent; then
+        confluent kafka topic delete "$TEST_TOPIC" --force >/dev/null 2>&1
+        debug "Cleaned up test topic: $TEST_TOPIC"
+    fi
+}
+
+# Run comprehensive diagnostics
+run_diagnostics() {
+    header "Kafka Cluster Diagnostics" "⚡"
+    
+    local results=()
+    
+    # Test different methods
+    if [[ "$VALIDATION_METHOD" == "all" || "$VALIDATION_METHOD" == "confluent" || -z "$VALIDATION_METHOD" ]]; then
+        if test_confluent_cli; then
+            results+=("confluent-cli:✅")
+        else
+            results+=("confluent-cli:❌")
+        fi
+    fi
+    
+    if [[ "$VALIDATION_METHOD" == "all" || "$VALIDATION_METHOD" == "kafka-tools" || -z "$VALIDATION_METHOD" ]]; then
+        if test_kafka_tools; then
+            results+=("kafka-tools:✅")
+        else
+            results+=("kafka-tools:❌")
+        fi
+    fi
+    
+    if [[ "$VALIDATION_METHOD" == "all" || "$VALIDATION_METHOD" == "kcat" || -z "$VALIDATION_METHOD" ]]; then
+        if test_kcat; then
+            results+=("kcat:✅")
+        else
+            results+=("kcat:❌")
+        fi
+    fi
+    
+    # Network test
+    if test_network_connectivity; then
+        results+=("network:✅")
+    else
+        results+=("network:❌")
+    fi
+    
+    # Get cluster information if available
+    local cluster_info=""
+    if command_exists confluent; then
+        cluster_info=$(confluent kafka cluster describe 2>/dev/null | head -5)
+    fi
+    
+    # Display results
+    echo
+    display_key_value \
+        "Bootstrap Servers=$BOOTSTRAP_SERVERS" \
+        "API Key=${KAFKA_API_KEY:0:8}..." \
+        "Timeout=${TIMEOUT}s"
+    
+    echo
+    info "Validation Results:"
+    for result in "${results[@]}"; do
+        local method="${result%:*}"
+        local status="${result#*:}"
+        printf "  %-15s %s\n" "$method" "$status"
+    done
+    
+    if [[ -n "$cluster_info" ]]; then
+        echo
+        info "Cluster Information:"
+        echo "$cluster_info"
+    fi
+}
+
+# Generate test commands
+generate_test_commands() {
+    header "Generated Test Commands" "📝"
+    
+    local config_file="/tmp/client.properties"
+    
+    echo "# Create client properties file:"
+    echo "cat > $config_file << EOF"
+    echo "bootstrap.servers=$BOOTSTRAP_SERVERS"
+    echo "security.protocol=SASL_SSL"
+    echo "sasl.mechanism=PLAIN"
+    echo "sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username='$KAFKA_API_KEY' password='$KAFKA_API_SECRET';"
+    echo "EOF"
+    echo
+    
+    echo "# Test with kafka-console-producer:"
+    echo "kafka-console-producer --bootstrap-server $BOOTSTRAP_SERVERS \\"
+    echo "  --producer.config $config_file \\"
+    echo "  --topic test-topic"
+    echo
+    
+    echo "# Test with kafka-console-consumer:"
+    echo "kafka-console-consumer --bootstrap-server $BOOTSTRAP_SERVERS \\"
+    echo "  --consumer.config $config_file \\"
+    echo "  --topic test-topic --from-beginning"
+    echo
+    
+    echo "# Test with kcat:"
+    echo "kcat -b $BOOTSTRAP_SERVERS \\"
+    echo "  -X security.protocol=SASL_SSL \\"
+    echo "  -X sasl.mechanism=PLAIN \\"
+    echo "  -X sasl.username=$KAFKA_API_KEY \\"
+    echo "  -X sasl.password=$KAFKA_API_SECRET \\"
+    echo "  -L"
+}
+
+# Main function
+main() {
+    # Initialize
+    init_common
+    
+    # Parse arguments
+    parse_args "$@"
+    
+    # Set defaults
+    OUTPUT_FORMAT="${OUTPUT_FORMAT:-$DEFAULT_OUTPUT_FORMAT}"
+    TIMEOUT="${TIMEOUT:-$DEFAULT_TIMEOUT}"
+    TEST_TOPIC="${TEST_TOPIC:-$DEFAULT_TEST_TOPIC}"
+    RUN_DIAGNOSTICS="${RUN_DIAGNOSTICS:-false}"
+    SSL_CHECK="${SSL_CHECK:-false}"
+    NETWORK_TEST="${NETWORK_TEST:-false}"
+    CREATE_TEST_TOPIC="${CREATE_TEST_TOPIC:-false}"
+    VALIDATION_METHOD="${VALIDATION_METHOD:-confluent}"
+    
+    # Show header
+    if ! is_quiet; then
+        header "$SCRIPT_DESCRIPTION" "⚡"
+    fi
+    
+    # Load and validate configuration
+    if ! init_config; then
+        exit 1
+    fi
+    
+    # Load Kafka configuration
+    if ! load_kafka_config; then
+        exit 1
+    fi
+    
+    # Check prerequisites
+    local missing_tools=()
+    if [[ "$VALIDATION_METHOD" == "all" || "$VALIDATION_METHOD" == "confluent" ]]; then
+        if ! command_exists confluent; then
+            missing_tools+=("confluent")
+        fi
+    fi
+    
+    if [[ "$VALIDATION_METHOD" == "all" || "$VALIDATION_METHOD" == "kafka-tools" ]]; then
+        if ! command_exists kafka-topics; then
+            missing_tools+=("kafka-tools")
+        fi
+    fi
+    
+    if [[ "$VALIDATION_METHOD" == "all" || "$VALIDATION_METHOD" == "kcat" ]]; then
+        if ! command_exists kcat; then
+            missing_tools+=("kcat")
+        fi
+    fi
+    
+    if [[ ${#missing_tools[@]} -gt 0 ]] && [[ "$VALIDATION_METHOD" != "all" ]]; then
+        error "Required tools missing: ${missing_tools[*]}"
+        exit 1
+    fi
+    
+    # Create test topic if requested
+    if [[ "$CREATE_TEST_TOPIC" == "true" ]]; then
+        create_test_topic
+        trap 'delete_test_topic' EXIT
+    fi
+    
+    # Run basic connectivity test
+    local test_passed=false
+    case "$VALIDATION_METHOD" in
+        confluent)
+            test_confluent_cli && test_passed=true
+            ;;
+        kafka-tools)
+            test_kafka_tools && test_passed=true
+            ;;
+        kcat)
+            test_kcat && test_passed=true
+            ;;
+        all|*)
+            if test_confluent_cli || test_kafka_tools || test_kcat; then
+                test_passed=true
+            fi
+            ;;
+    esac
+    
+    if [[ "$test_passed" != "true" ]]; then
+        error "All connectivity tests failed"
+        exit 1
+    fi
+    
+    # Run diagnostics if requested
+    if [[ "$RUN_DIAGNOSTICS" == "true" ]]; then
+        echo
+        run_diagnostics
+    fi
+    
+    # Run network test if requested
+    if [[ "$NETWORK_TEST" == "true" ]]; then
+        echo
+        test_network_connectivity
+    fi
+    
+    # Run SSL check if requested
+    if [[ "$SSL_CHECK" == "true" ]]; then
+        echo
+        check_ssl_certificates
+    fi
+    
+    # Generate test commands if verbose
+    if is_verbose; then
+        echo
+        generate_test_commands
+    fi
+    
+    success "Kafka connectivity validation completed successfully"
+}
+
+# Run main function
+main "$@"

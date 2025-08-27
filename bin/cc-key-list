@@ -1,0 +1,193 @@
+#!/bin/bash
+# cc-key-list-simple - Simplified API key listing and deletion utility
+
+# Get script directory and source shared libraries
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+
+source "$LIB_DIR/common.sh"
+source "$LIB_DIR/config.sh"
+source "$LIB_DIR/validation.sh"
+source "$LIB_DIR/output.sh"
+
+# Script metadata
+SCRIPT_NAME="cc-key-list"
+SCRIPT_VERSION="1.0.0"
+SCRIPT_DESCRIPTION="API key inventory management with deletion capabilities"
+
+# Usage function
+usage() {
+    cat << EOF
+${BLUE}${KEY} $SCRIPT_NAME v$SCRIPT_VERSION${RESET}
+$SCRIPT_DESCRIPTION
+
+${YELLOW}Usage:${RESET}
+  $SCRIPT_NAME [OPTIONS]
+
+${YELLOW}Options:${RESET}
+  -o, --output FORMAT         Output format (table, json)
+  -r, --resource-type TYPE    Filter by resource type (kafka, schema-registry, cloud, etc.)
+  -d, --delete KEY           Delete specific API key
+  --list-only                List keys only (no deletion options)
+  -h, --help                 Show this help message
+
+${YELLOW}Examples:${RESET}
+  $SCRIPT_NAME                    # List all keys
+  $SCRIPT_NAME -o json            # JSON output
+  $SCRIPT_NAME -r kafka           # Kafka keys only
+  $SCRIPT_NAME -d KEY123          # Delete specific key
+
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -o|--output)
+                OUTPUT_FORMAT="$2"
+                shift 2
+                ;;
+            -r|--resource-type)
+                RESOURCE_TYPE="$2"
+                shift 2
+                ;;
+            -d|--delete)
+                DELETE_KEY="$2"
+                shift 2
+                ;;
+            --list-only)
+                LIST_ONLY="true"
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# Get and display API keys
+list_keys() {
+    progress "Retrieving API key inventory"
+    
+    local keys_output
+    if ! keys_output=$(confluent api-key list -o json 2>/dev/null); then
+        error "Failed to retrieve API keys"
+        return 1
+    fi
+    
+    if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+        echo "$keys_output" | jq .
+        return 0
+    fi
+    
+    # Table format
+    printf "${CYAN}%-3s %-20s %-15s %-15s %-30s${RESET}\n" \
+        "#" "API Key" "Resource ID" "Resource Type" "Description"
+    printf "${BLUE}%s${RESET}\n" "$(printf '%.90s' "$(printf '%*s' 90 '' | tr ' ' '-')")"
+    
+    local index=1
+    echo "$keys_output" | jq -r '.[] | @json' | while read -r key_line; do
+        local api_key=$(echo "$key_line" | jq -r '.key')
+        local resource_id=$(echo "$key_line" | jq -r '.resource // "N/A"')
+        local resource_type=$(echo "$key_line" | jq -r '.resource_type // "unknown"')
+        local description=$(echo "$key_line" | jq -r '.description // "N/A"')
+        
+        # Apply resource filter if specified
+        if [[ -n "$RESOURCE_TYPE" && "$resource_type" != "$RESOURCE_TYPE" ]]; then
+            continue
+        fi
+        
+        # Truncate long values
+        local short_key="${api_key:0:18}"
+        if [[ ${#api_key} -gt 18 ]]; then
+            short_key="${short_key}..."
+        fi
+        
+        local short_resource="${resource_id:0:13}"
+        if [[ ${#resource_id} -gt 13 ]]; then
+            short_resource="${short_resource}..."
+        fi
+        
+        local short_desc="${description:0:28}"
+        if [[ ${#description} -gt 28 ]]; then
+            short_desc="${short_desc}..."
+        fi
+        
+        printf "%-3s %-20s %-15s %-15s %-30s\n" \
+            "$index" "$short_key" "$short_resource" "$resource_type" "$short_desc"
+        
+        ((index++))
+    done
+}
+
+# Delete API key
+delete_key() {
+    local api_key="$1"
+    
+    warning "Deleting API key: $api_key"
+    
+    if confirm "Are you sure you want to delete this API key?"; then
+        if confluent api-key delete "$api_key" --force >/dev/null 2>&1; then
+            success "Successfully deleted API key: $api_key"
+        else
+            error "Failed to delete API key: $api_key"
+            return 1
+        fi
+    else
+        info "Deletion cancelled"
+    fi
+}
+
+# Main function
+main() {
+    # Initialize
+    init_common
+    
+    # Parse arguments
+    parse_args "$@"
+    
+    # Set defaults
+    OUTPUT_FORMAT="${OUTPUT_FORMAT:-table}"
+    LIST_ONLY="${LIST_ONLY:-false}"
+    
+    # Show header
+    if ! is_quiet; then
+        header "$SCRIPT_DESCRIPTION" "$KEY"
+    fi
+    
+    # Load and validate configuration
+    if ! init_config; then
+        exit 1
+    fi
+    
+    # Check prerequisites
+    if ! check_prerequisites; then
+        exit 1
+    fi
+    
+    # Handle deletion
+    if [[ -n "$DELETE_KEY" ]]; then
+        delete_key "$DELETE_KEY"
+        exit $?
+    fi
+    
+    # List keys
+    list_keys
+    
+    # Show deletion hint
+    if [[ "$LIST_ONLY" != "true" && "$OUTPUT_FORMAT" == "table" ]]; then
+        echo
+        info "Use -d KEY to delete a specific key"
+    fi
+}
+
+# Run main function
+main "$@"
