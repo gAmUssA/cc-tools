@@ -238,7 +238,12 @@ create_api_key() {
         return 1
     fi
     
-    local cmd="confluent api-key create --resource $resource_id --description \"$description\""
+    local cmd
+    if [[ "$resource_type" == "tableflow" ]]; then
+        cmd="confluent api-key create --resource tableflow --description \"$description\""
+    else
+        cmd="confluent api-key create --resource $resource_id --description \"$description\""
+    fi
     
     if is_dry_run; then
         info "DRY RUN: Would execute: $cmd"

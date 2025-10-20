@@ -1,0 +1,388 @@
+#!/bin/bash
+# cc-tableflow-properties - Generate TableFlow properties files
+# Part of Confluent Cloud Tools
+
+# Get script directory and source shared libraries
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+
+# shellcheck source=../lib/common.sh
+source "$LIB_DIR/common.sh"
+# shellcheck source=../lib/config.sh
+source "$LIB_DIR/config.sh"
+# shellcheck source=../lib/validation.sh
+source "$LIB_DIR/validation.sh"
+# shellcheck source=../lib/output.sh
+source "$LIB_DIR/output.sh"
+
+# Script configuration
+SCRIPT_NAME="cc-tableflow-properties"
+VERSION="1.0.0"
+
+# Default values
+DEFAULT_OUTPUT_DIR="properties"
+DEFAULT_OUTPUT_FILE="tableflow.properties"
+DEFAULT_CONNECTOR_NAME="iceberg"
+DEFAULT_SECURITY_MODE="read_only"
+
+# Usage information
+usage() {
+    cat << EOF
+${BLUE}${TABLEFLOW} TableFlow Properties Generator${RESET}
+
+${YELLOW}USAGE:${RESET}
+    $SCRIPT_NAME [OPTIONS] [OUTPUT_FILE]
+
+${YELLOW}DESCRIPTION:${RESET}
+    Generate TableFlow properties files for Iceberg connector configuration.
+    Creates properly formatted configuration files with OAuth2 credentials,
+    catalog URLs, and S3 settings.
+
+${YELLOW}OPTIONS:${RESET}
+    -c, --connector NAME      Connector name (default: iceberg)
+    -s, --security MODE       Security mode: read_only, read_write (default: read_only)
+    -r, --region REGION       S3 region override (default: from environment)
+    -e, --env-file FILE       Environment file to load (default: .env)
+    --catalog-url URL         Override catalog URL (auto-generated if not provided)
+    --dry-run                 Show what would be generated without creating file
+    --force                   Overwrite existing files without confirmation
+    -q, --quiet               Suppress non-essential output
+    -v, --verbose             Enable verbose output
+    -h, --help                Show this help message
+
+${YELLOW}ARGUMENTS:${RESET}
+  -o, --output FILE           Output file path (default: $DEFAULT_OUTPUT_DIR/$DEFAULT_OUTPUT_FILE)
+  -d, --output-dir DIR        Output directory (default: $DEFAULT_OUTPUT_DIR)
+
+${YELLOW}EXAMPLES:${RESET}
+    # Generate default properties file
+    $SCRIPT_NAME
+
+    # Generate with custom connector name
+    $SCRIPT_NAME --connector my-iceberg-connector
+
+    # Generate with read-write access
+    $SCRIPT_NAME --security read_write
+
+    # Generate to specific file
+    $SCRIPT_NAME /path/to/my-tableflow.properties
+
+    # Preview without creating file
+    $SCRIPT_NAME --dry-run
+
+${YELLOW}ENVIRONMENT VARIABLES:${RESET}
+    CC_TF_API_KEY            TableFlow API key
+    CC_TF_API_SECRET         TableFlow API secret
+    CC_TF_CATALOG_URL        TableFlow catalog URL (auto-generated if not set)
+    CC_ORG_ID               Organization ID
+    CC_ENV                  Environment ID
+    CC_REGION               Region (default: us-west-2)
+
+${YELLOW}GENERATED PROPERTIES FORMAT:${RESET}
+    connector.name=iceberg
+    iceberg.catalog.type=rest
+    iceberg.rest-catalog.oauth2.credential=API_KEY:API_SECRET
+    iceberg.rest-catalog.security=OAUTH2
+    iceberg.rest-catalog.uri=CATALOG_URL
+    iceberg.rest-catalog.vended-credentials-enabled=true
+    fs.native-s3.enabled=true
+    s3.region=REGION
+    iceberg.security=SECURITY_MODE
+
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -c|--connector)
+                CONNECTOR_NAME="$2"
+                shift 2
+                ;;
+            -s|--security)
+                SECURITY_MODE="$2"
+                shift 2
+                ;;
+            -r|--region)
+                S3_REGION="$2"
+                shift 2
+                ;;
+            -e|--env-file)
+                CC_ENV_FILE="$2"
+                shift 2
+                ;;
+            --catalog-url)
+                CATALOG_URL_OVERRIDE="$2"
+                shift 2
+                ;;
+            --dry-run)
+                CC_DRY_RUN="true"
+                shift
+                ;;
+            --force)
+                CC_FORCE="true"
+                shift
+                ;;
+            -q|--quiet)
+                CC_QUIET="true"
+                shift
+                ;;
+            -v|--verbose)
+                CC_VERBOSE="true"
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -o|--output)
+                OUTPUT_FILE="$2"
+                shift 2
+                ;;
+            -d|--output-dir)
+                OUTPUT_DIR="$2"
+                shift 2
+                ;;
+            -*)
+                error "Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 1
+                ;;
+            *)
+                # Positional argument - output file
+                OUTPUT_FILE="$1"
+                shift
+                ;;
+        esac
+    done
+}
+
+# Validate security mode
+validate_security_mode() {
+    local mode="$1"
+    case "$mode" in
+        read_only|read_write)
+            return 0
+            ;;
+        *)
+            error "Invalid security mode: $mode"
+            info "Valid modes: read_only, read_write"
+            return 1
+            ;;
+    esac
+}
+
+# Validate prerequisites
+validate_prerequisites() {
+    progress "Validating prerequisites"
+    
+    # Load environment
+    load_env || return 1
+    
+    # Validate TableFlow environment variables
+    validate_tableflow_env || return 1
+    
+    # Validate security mode
+    validate_security_mode "$SECURITY_MODE" || return 1
+    
+    success "Prerequisites validated"
+    return 0
+}
+
+# Generate properties content
+generate_properties_content() {
+    local connector_name="$1"
+    local security_mode="$2"
+    local s3_region="$3"
+    local catalog_url="$4"
+    
+    cat << EOF
+# Generated by $SCRIPT_NAME on $(date)
+# TableFlow Iceberg Connector Configuration
+
+# Connector Configuration
+connector.name=${connector_name}
+
+# Iceberg Catalog Configuration
+iceberg.catalog.type=rest
+iceberg.rest-catalog.oauth2.credential=${CC_TF_API_KEY}:${CC_TF_API_SECRET}
+iceberg.rest-catalog.security=OAUTH2
+iceberg.rest-catalog.uri=${catalog_url}
+iceberg.rest-catalog.vended-credentials-enabled=true
+
+# File System Configuration
+fs.native-s3.enabled=true
+s3.region=${s3_region}
+
+# Security Configuration
+iceberg.security=${security_mode}
+EOF
+}
+
+# Create properties file
+create_properties_file() {
+    local output_file="$1"
+    local content="$2"
+    
+    # Check if file exists and handle overwrite
+    if [[ -f "$output_file" ]] && [[ "$CC_FORCE" != "true" ]]; then
+        if ! confirm "File $output_file already exists. Overwrite?" "n"; then
+            info "Operation cancelled"
+            return 1
+        fi
+    fi
+    
+    if is_dry_run; then
+        info "DRY RUN: Would create file: $output_file"
+        echo
+        echo -e "${CYAN}File content:${RESET}"
+        echo "$content"
+        return 0
+    fi
+    
+    # Create directory if it doesn't exist
+    local dir
+    dir=$(dirname "$output_file")
+    if [[ ! -d "$dir" ]]; then
+        mkdir -p "$dir"
+        debug "Created directory: $dir"
+    fi
+    
+    # Write content to file
+    echo "$content" > "$output_file"
+    
+    if [[ $? -eq 0 ]]; then
+        success "Properties file created: $output_file"
+        return 0
+    else
+        error "Failed to create properties file: $output_file"
+        return 1
+    fi
+}
+
+# Display file summary
+display_summary() {
+    local output_file="$1"
+    local connector_name="$2"
+    local security_mode="$3"
+    local s3_region="$4"
+    local catalog_url="$5"
+    
+    if is_quiet; then
+        return 0
+    fi
+    
+    echo
+    echo -e "${BLUE}${TABLEFLOW} TableFlow Properties Summary${RESET}"
+    echo -e "${BLUE}$(printf '=%.0s' $(seq 1 40))${RESET}"
+    echo -e "${CYAN}File:${RESET}           $output_file"
+    echo -e "${CYAN}Connector:${RESET}      $connector_name"
+    echo -e "${CYAN}Security Mode:${RESET}  $security_mode"
+    echo -e "${CYAN}S3 Region:${RESET}     $s3_region"
+    echo -e "${CYAN}Catalog URL:${RESET}   $catalog_url"
+    echo -e "${CYAN}Environment:${RESET}   $CC_ENV"
+    echo -e "${CYAN}Organization:${RESET}  $CC_ORG_ID"
+    echo
+    
+    if [[ -f "$output_file" ]] && [[ "$CC_DRY_RUN" != "true" ]]; then
+        local file_size
+        file_size=$(wc -c < "$output_file" 2>/dev/null || echo "unknown")
+        echo -e "${CYAN}File Size:${RESET}     ${file_size} bytes"
+        
+        info "Usage examples:"
+        echo -e "  ${GREEN}Java:${RESET}        Properties props = new Properties(); props.load(new FileInputStream(\"$output_file\"));"
+        echo -e "  ${GREEN}Python:${RESET}      import configparser; config = configparser.ConfigParser(); config.read('$output_file')"
+        echo -e "  ${GREEN}Spark:${RESET}       spark.conf.set('spark.sql.catalog.iceberg', 'org.apache.iceberg.spark.SparkCatalog')"
+        echo
+    fi
+}
+
+# Main execution function
+main() {
+    # Initialize defaults
+    OUTPUT_DIR="${OUTPUT_DIR:-$DEFAULT_OUTPUT_DIR}"
+    OUTPUT_FILE="${OUTPUT_FILE:-$OUTPUT_DIR/$DEFAULT_OUTPUT_FILE}"
+    CONNECTOR_NAME="$DEFAULT_CONNECTOR_NAME"
+    SECURITY_MODE="$DEFAULT_SECURITY_MODE"
+    S3_REGION=""
+    CATALOG_URL_OVERRIDE=""
+    
+    # Parse arguments
+    parse_args "$@"
+    
+    # Show header
+    header "TableFlow Properties Generator" "$TABLEFLOW"
+    
+    # Validate prerequisites
+    validate_prerequisites || exit 1
+    
+    # Set S3 region (use override or Kafka cluster region)
+    local s3_region
+    if [[ -n "$S3_REGION" ]]; then
+        s3_region="$S3_REGION"
+    else
+        s3_region="${CONFLUENT_REGION:-us-west-2}"
+    fi
+    
+    # Generate or use provided catalog URL
+    local catalog_url
+    if [[ -n "$CATALOG_URL_OVERRIDE" ]]; then
+        catalog_url="$CATALOG_URL_OVERRIDE"
+    elif [[ -n "$CC_TF_CATALOG_URL" ]]; then
+        catalog_url="$CC_TF_CATALOG_URL"
+    else
+        catalog_url=$(generate_tableflow_catalog_url)
+        if [[ $? -ne 0 ]]; then
+            error "Failed to generate catalog URL"
+            exit 1
+        fi
+    fi
+    
+    # Show current configuration
+    if is_verbose; then
+        info "Configuration:"
+        echo -e "  ${BLUE}Output File:${RESET}    $OUTPUT_FILE"
+        echo -e "  ${BLUE}Connector:${RESET}      $CONNECTOR_NAME"
+        echo -e "  ${BLUE}Security Mode:${RESET}  $SECURITY_MODE"
+        echo -e "  ${BLUE}S3 Region:${RESET}     $s3_region"
+        echo -e "  ${BLUE}Catalog URL:${RESET}   $catalog_url"
+        echo -e "  ${BLUE}Environment:${RESET}   $CC_ENV"
+        echo -e "  ${BLUE}Organization:${RESET}  $CC_ORG_ID"
+        echo
+    fi
+    
+    # Generate properties content
+    local properties_content
+    properties_content=$(generate_properties_content "$CONNECTOR_NAME" "$SECURITY_MODE" "$s3_region" "$catalog_url")
+    
+    # Create output directory and properties file
+    if ! is_dry_run; then
+        # Create output directory
+        if ! mkdir -p "$(dirname "$OUTPUT_FILE")"; then
+            error "Failed to create output directory: $(dirname "$OUTPUT_FILE")"
+            exit 1
+        fi
+    fi
+    
+    create_properties_file "$OUTPUT_FILE" "$properties_content" || exit 1
+    
+    # Display summary
+    display_summary "$OUTPUT_FILE" "$CONNECTOR_NAME" "$SECURITY_MODE" "$s3_region" "$catalog_url"
+    
+    # Success message
+    if [[ "$CC_DRY_RUN" != "true" ]]; then
+        echo
+        success "TableFlow properties file generated successfully!"
+        
+        if ! is_quiet; then
+            info "Next steps:"
+            echo -e "  ${GREEN}1.${RESET} Test connectivity: ${CYAN}cc-tableflow-validate${RESET}"
+            echo -e "  ${GREEN}2.${RESET} Use in your application with the generated properties"
+            echo -e "  ${GREEN}3.${RESET} Configure your Iceberg client to use the properties file"
+        fi
+    fi
+}
+
+# Execute main function
+main "$@"

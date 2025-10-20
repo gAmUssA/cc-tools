@@ -1,0 +1,408 @@
+#!/bin/bash
+# cc-tableflow-key-create - Create TableFlow API keys and secrets
+# Part of Confluent Cloud Tools
+
+# Get script directory and source shared libraries
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+
+# shellcheck source=../lib/common.sh
+source "$LIB_DIR/common.sh"
+# shellcheck source=../lib/config.sh
+source "$LIB_DIR/config.sh"
+# shellcheck source=../lib/validation.sh
+source "$LIB_DIR/validation.sh"
+# shellcheck source=../lib/output.sh
+source "$LIB_DIR/output.sh"
+
+# Script configuration
+SCRIPT_NAME="cc-tableflow-key-create"
+VERSION="1.0.0"
+
+# Default values
+DEFAULT_DESCRIPTION="TableFlow API Key created by $SCRIPT_NAME on $(date)"
+DEFAULT_OUTPUT_FORMAT="table"
+
+# Usage information
+usage() {
+    cat << EOF
+${BLUE}${TABLEFLOW} TableFlow API Key Creator${RESET}
+
+${YELLOW}USAGE:${RESET}
+    $SCRIPT_NAME [OPTIONS]
+
+${YELLOW}DESCRIPTION:${RESET}
+    Create TableFlow API keys and secrets for Iceberg catalog access.
+    Automatically generates keys and updates environment configuration.
+
+${YELLOW}OPTIONS:${RESET}
+    -d, --description DESC    Custom description for the API key
+    -o, --output FORMAT       Output format: table, json, csv, yaml (default: table)
+    -e, --env-file FILE       Environment file to load (default: .env)
+    -c, --config-dir DIR      Configuration directory (default: ~/.confluent)
+    --auto-store              Automatically store credentials in .env file
+    --dry-run                 Show what would be done without executing
+    --force                   Skip confirmation prompts
+    -q, --quiet               Suppress non-essential output
+    -v, --verbose             Enable verbose output
+    -h, --help                Show this help message
+
+${YELLOW}EXAMPLES:${RESET}
+    # Interactive key creation
+    $SCRIPT_NAME
+
+    # Create key with custom description
+    $SCRIPT_NAME --description "Production TableFlow Access"
+
+    # Create key and auto-store in .env
+    $SCRIPT_NAME --auto-store
+
+    # Dry run to see what would be created
+    $SCRIPT_NAME --dry-run
+
+${YELLOW}ENVIRONMENT VARIABLES:${RESET}
+    CC_CLOUD_API_KEY         Confluent Cloud API key for management operations
+    CC_CLOUD_API_SECRET      Confluent Cloud API secret
+    CC_ENV                   Environment ID
+    CC_ORG_ID               Organization ID
+    CC_REGION               Region (default: us-west-2)
+
+${YELLOW}OUTPUT FORMATS:${RESET}
+    table    Human-readable table with colors and emojis
+    json     Structured JSON for programmatic use
+    csv      Comma-separated values for spreadsheet import
+    yaml     YAML format for configuration management
+
+EOF
+}
+
+# Parse command line arguments
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -d|--description)
+                DESCRIPTION="$2"
+                shift 2
+                ;;
+            -o|--output)
+                OUTPUT_FORMAT="$2"
+                shift 2
+                ;;
+            -e|--env-file)
+                CC_ENV_FILE="$2"
+                shift 2
+                ;;
+            -c|--config-dir)
+                CC_CONFIG_DIR="$2"
+                shift 2
+                ;;
+            --auto-store)
+                AUTO_STORE="true"
+                shift
+                ;;
+            --dry-run)
+                CC_DRY_RUN="true"
+                shift
+                ;;
+            --force)
+                CC_FORCE="true"
+                shift
+                ;;
+            -q|--quiet)
+                CC_QUIET="true"
+                shift
+                ;;
+            -v|--verbose)
+                CC_VERBOSE="true"
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                error "Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 1
+                ;;
+        esac
+    done
+}
+
+# Validate prerequisites
+validate_prerequisites() {
+    progress "Validating prerequisites"
+    
+    # Check for confluent CLI
+    if ! command_exists confluent; then
+        error "Confluent CLI not found. Please install it first:"
+        info "curl -sL --http1.1 https://cnfl.io/cli | sh -s -- latest"
+        return 1
+    fi
+    
+    # Check authentication
+    if ! confluent environment list >/dev/null 2>&1; then
+        error "Not authenticated with Confluent Cloud"
+        info "Please run: confluent login --save"
+        return 1
+    fi
+    
+    # Load and validate environment
+    load_env || return 1
+    
+    # Validate required variables for TableFlow
+    local required_vars=("CC_CLOUD_API_KEY" "CC_CLOUD_API_SECRET" "CC_ENV" "CC_ORG_ID")
+    local missing_vars=()
+    
+    for var in "${required_vars[@]}"; do
+        if [[ -z "${!var}" ]]; then
+            missing_vars+=("$var")
+        fi
+    done
+    
+    if [[ ${#missing_vars[@]} -gt 0 ]]; then
+        error "Missing required environment variables for TableFlow operations:"
+        for var in "${missing_vars[@]}"; do
+            echo -e "  ${RED}${ERROR}${RESET} $var"
+        done
+        return 1
+    fi
+    
+    success "Prerequisites validated"
+    return 0
+}
+
+# Create TableFlow API key
+create_tableflow_key() {
+    local description="$1"
+    
+    progress "Creating TableFlow API key"
+    
+    if is_dry_run; then
+        info "DRY RUN: Would create TableFlow API key with description: $description"
+        # Mock response for dry run
+        echo '{"id":"tfkey-12345","key":"MZAZ6HHUAMC2BWNC","secret":"VYEFLE5kGKJUv0RxG0s1awwafOQWtTAW1gEIdA36zMMSWETPGhUEGKIpFqECqQgH","description":"'"$description"'","created":"2024-01-01T00:00:00Z"}'
+        return 0
+    fi
+    
+    # Use confluent CLI to create TableFlow API key
+    local result
+    result=$(confluent tableflow api-key create \
+        --description "$description" \
+        --output json 2>/dev/null)
+    
+    if [[ $? -ne 0 ]]; then
+        error "Failed to create TableFlow API key"
+        debug "CLI output: $result"
+        return 1
+    fi
+    
+    echo "$result"
+    return 0
+}
+
+# Store credentials in environment file
+store_credentials() {
+    local api_key="$1"
+    local api_secret="$2"
+    local env_file="${CC_ENV_FILE:-$DEFAULT_ENV_FILE}"
+    
+    if [[ "$AUTO_STORE" != "true" ]]; then
+        return 0
+    fi
+    
+    progress "Storing credentials in $env_file"
+    
+    if is_dry_run; then
+        info "DRY RUN: Would update $env_file with TableFlow credentials"
+        return 0
+    fi
+    
+    # Create backup
+    if [[ -f "$env_file" ]]; then
+        cp "$env_file" "${env_file}.backup.$(date +%Y%m%d_%H%M%S)"
+        debug "Created backup: ${env_file}.backup.$(date +%Y%m%d_%H%M%S)"
+    fi
+    
+    # Update or add TableFlow credentials
+    if grep -q "^export CC_TF_API_KEY=" "$env_file" 2>/dev/null; then
+        # Update existing entries
+        sed -i.tmp "s/^export CC_TF_API_KEY=.*/export CC_TF_API_KEY=$api_key/" "$env_file"
+        sed -i.tmp "s/^export CC_TF_API_SECRET=.*/export CC_TF_API_SECRET=$api_secret/" "$env_file"
+        rm -f "${env_file}.tmp"
+    else
+        # Add new entries
+        cat >> "$env_file" << EOF
+
+# TableFlow Configuration (added by $SCRIPT_NAME)
+export CC_TF_API_KEY=$api_key
+export CC_TF_API_SECRET=$api_secret
+EOF
+    fi
+    
+    # Generate catalog URL and add if not present
+    local catalog_url
+    catalog_url=$(generate_tableflow_catalog_url)
+    if [[ $? -eq 0 && -n "$catalog_url" ]]; then
+        if ! grep -q "^export CC_TF_CATALOG_URL=" "$env_file" 2>/dev/null; then
+            echo "export CC_TF_CATALOG_URL=$catalog_url" >> "$env_file"
+        else
+            sed -i.tmp "s|^export CC_TF_CATALOG_URL=.*|export CC_TF_CATALOG_URL=$catalog_url|" "$env_file"
+            rm -f "${env_file}.tmp"
+        fi
+    fi
+    
+    success "Credentials stored in $env_file"
+    return 0
+}
+
+# Main execution function
+main() {
+    # Initialize default values
+    DESCRIPTION="$DEFAULT_DESCRIPTION"
+    OUTPUT_FORMAT="$DEFAULT_OUTPUT_FORMAT"
+    AUTO_STORE="false"
+    
+    # Parse arguments
+    parse_args "$@"
+    
+    # Show header
+    header "TableFlow API Key Creator" "$TABLEFLOW"
+    
+    # Validate prerequisites
+    validate_prerequisites || exit 1
+    
+    # Show current configuration
+    if is_verbose; then
+        info "Configuration:"
+        echo -e "  ${BLUE}Environment:${RESET} ${CC_ENV}"
+        echo -e "  ${BLUE}Organization:${RESET} ${CC_ORG_ID}"
+        echo -e "  ${BLUE}Region:${RESET} ${CC_REGION:-us-west-2}"
+        echo -e "  ${BLUE}Description:${RESET} $DESCRIPTION"
+        echo -e "  ${BLUE}Output Format:${RESET} $OUTPUT_FORMAT"
+        echo -e "  ${BLUE}Auto Store:${RESET} $AUTO_STORE"
+        echo
+    fi
+    
+    # Confirmation prompt
+    if ! is_dry_run && ! confirm "Create TableFlow API key?" "y"; then
+        info "Operation cancelled"
+        exit 0
+    fi
+    
+    # Create the API key
+    local key_result
+    key_result=$(create_tableflow_key "$DESCRIPTION")
+    if [[ $? -ne 0 ]]; then
+        error "Failed to create TableFlow API key"
+        exit 1
+    fi
+    
+    # Parse the result
+    local api_key api_secret key_id created_date
+    if command_exists jq; then
+        api_key=$(echo "$key_result" | jq -r '.key // .api_key // empty')
+        api_secret=$(echo "$key_result" | jq -r '.secret // .api_secret // empty')
+        key_id=$(echo "$key_result" | jq -r '.id // .key_id // empty')
+        created_date=$(echo "$key_result" | jq -r '.created // .created_at // empty')
+    else
+        # Fallback parsing without jq
+        api_key=$(echo "$key_result" | grep -o '"key":"[^"]*"' | cut -d'"' -f4)
+        api_secret=$(echo "$key_result" | grep -o '"secret":"[^"]*"' | cut -d'"' -f4)
+        key_id=$(echo "$key_result" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+    fi
+    
+    if [[ -z "$api_key" || -z "$api_secret" ]]; then
+        error "Failed to parse API key response"
+        debug "Response: $key_result"
+        exit 1
+    fi
+    
+    # Store credentials if requested
+    store_credentials "$api_key" "$api_secret"
+    
+    # Generate catalog URL
+    local catalog_url
+    catalog_url=$(generate_tableflow_catalog_url)
+    
+    # Prepare output data
+    local output_data
+    case "$OUTPUT_FORMAT" in
+        json)
+            output_data=$(cat << EOF
+{
+  "id": "$key_id",
+  "api_key": "$api_key",
+  "api_secret": "$api_secret",
+  "catalog_url": "$catalog_url",
+  "description": "$DESCRIPTION",
+  "created": "$created_date",
+  "environment": "$CC_ENV",
+  "organization": "$CC_ORG_ID",
+  "region": "${CC_REGION:-us-west-2}"
+}
+EOF
+)
+            ;;
+        csv)
+            output_data="ID,API Key,API Secret,Catalog URL,Description,Created,Environment,Organization,Region"$'\n'
+            output_data+="$key_id,$api_key,$api_secret,$catalog_url,$DESCRIPTION,$created_date,$CC_ENV,$CC_ORG_ID,${CC_REGION:-us-west-2}"
+            ;;
+        yaml)
+            output_data=$(cat << EOF
+id: $key_id
+api_key: $api_key
+api_secret: $api_secret
+catalog_url: $catalog_url
+description: $DESCRIPTION
+created: $created_date
+environment: $CC_ENV
+organization: $CC_ORG_ID
+region: ${CC_REGION:-us-west-2}
+EOF
+)
+            ;;
+        table|*)
+            if ! is_quiet; then
+                echo
+                success "TableFlow API key created successfully!"
+                echo
+                echo -e "${BLUE}${TABLEFLOW} TableFlow API Key Details${RESET}"
+                echo -e "${BLUE}$(printf '=%.0s' $(seq 1 35))${RESET}"
+                echo -e "${CYAN}ID:${RESET}           $key_id"
+                echo -e "${CYAN}API Key:${RESET}      $api_key"
+                echo -e "${CYAN}API Secret:${RESET}   ${api_secret:0:20}..."
+                echo -e "${CYAN}Catalog URL:${RESET}  $catalog_url"
+                echo -e "${CYAN}Description:${RESET}  $DESCRIPTION"
+                echo -e "${CYAN}Environment:${RESET}  $CC_ENV"
+                echo -e "${CYAN}Organization:${RESET} $CC_ORG_ID"
+                echo -e "${CYAN}Region:${RESET}       ${CC_REGION:-us-west-2}"
+                if [[ -n "$created_date" ]]; then
+                    echo -e "${CYAN}Created:${RESET}      $created_date"
+                fi
+                echo
+                
+                if [[ "$AUTO_STORE" == "true" ]]; then
+                    info "Credentials have been stored in ${CC_ENV_FILE:-$DEFAULT_ENV_FILE}"
+                else
+                    warning "Remember to store these credentials securely!"
+                    info "You can add them to your .env file:"
+                    echo -e "  ${YELLOW}export CC_TF_API_KEY=$api_key${RESET}"
+                    echo -e "  ${YELLOW}export CC_TF_API_SECRET=$api_secret${RESET}"
+                    echo -e "  ${YELLOW}export CC_TF_CATALOG_URL=$catalog_url${RESET}"
+                fi
+                echo
+                info "Next steps:"
+                echo -e "  ${GREEN}1.${RESET} Generate TableFlow properties: ${CYAN}cc-tableflow-properties${RESET}"
+                echo -e "  ${GREEN}2.${RESET} Test connectivity: ${CYAN}cc-tableflow-validate${RESET}"
+            fi
+            return 0
+            ;;
+    esac
+    
+    # Output the formatted data
+    echo "$output_data"
+}
+
+# Execute main function
+main "$@"

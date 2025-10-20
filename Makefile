@@ -401,20 +401,34 @@ setup-env-auto: ## 🚀 Automated environment setup with key creation
 >   exit 1; \
 > fi
 
-# Schema Registry validation targets
-validate-sr: ## 🔍 Validate Schema Registry connectivity
-> @echo -e "$(BLUE)$(VALIDATE) Validating Schema Registry connectivity$(RESET)"
-> @if [ -f "$(BIN_DIR)/cc-sr-validate" ]; then \
->   $(BIN_DIR)/cc-sr-validate; \
+# Generate TableFlow properties target
+generate-tableflow-props: ## 🏔️ Generate TableFlow properties file
+> @echo -e "$(BLUE)$(TABLEFLOW) Generating TableFlow Properties$(RESET)"
+> @echo -e "$(BLUE)=================================$(RESET)"
+> @if [ -f "$(BIN_DIR)/cc-tableflow-properties" ]; then \
+>   $(BIN_DIR)/cc-tableflow-properties; \
 > else \
->   echo -e "$(RED)$(ERROR) cc-sr-validate utility not found$(RESET)"; \
+>   echo -e "$(RED)$(ERROR) cc-tableflow-properties utility not found$(RESET)"; \
 >   exit 1; \
 > fi
 
-validate-sr-full: ## 🔍 Run full Schema Registry diagnostics
-> @echo -e "$(BLUE)$(VALIDATE) Running full Schema Registry diagnostics$(RESET)"
+# Validate TableFlow target
+validate-tableflow: ## 🏔️ Validate TableFlow connectivity
+> @echo -e "$(BLUE)$(TABLEFLOW) Validating TableFlow connectivity$(RESET)"
+> @if [ -f "$(BIN_DIR)/cc-tableflow-validate" ]; then \
+>   $(BIN_DIR)/cc-tableflow-validate; \
+> else \
+>   echo -e "$(YELLOW)$(WARNING) cc-tableflow-validate utility not implemented yet$(RESET)"; \
+>   echo -e "$(CYAN)$(GEAR) Running basic TableFlow validation...$(RESET)"; \
+>   if [ -f "$(LIB_DIR)/config.sh" ]; then \
+>     source $(LIB_DIR)/config.sh && validate_tableflow_env; \
+>   fi; \
+> fi
+
+validate-sr: ## 🔍 Validate Schema Registry connectivity
+> @echo -e "$(BLUE)$(VALIDATE) Validating Schema Registry$(RESET)"
 > @if [ -f "$(BIN_DIR)/cc-sr-validate" ]; then \
->   $(BIN_DIR)/cc-sr-validate -d; \
+>   $(BIN_DIR)/cc-sr-validate; \
 > else \
 >   echo -e "$(RED)$(ERROR) cc-sr-validate utility not found$(RESET)"; \
 >   exit 1; \
