@@ -53,6 +53,7 @@ TEMPLATES_DIR := templates
 TESTS_DIR := tests
 BUILD_DIR := build
 TMP_DIR := tmp
+OUT_DIR := out
 
 # Installation directories
 PREFIX := /usr/local
@@ -61,7 +62,7 @@ INSTALL_LIB_DIR := $(PREFIX)/lib/cc-tools
 INSTALL_TEMPLATES_DIR := $(PREFIX)/share/cc-tools/templates
 
 # Utilities to install
-UTILITIES := cc-key-create cc-key-rotate cc-key-audit cc-key-sync cc-key-health cc-env-bootstrap cc-config-generate cc-property-files
+UTILITIES := cc-key-create cc-key-rotate cc-key-audit cc-key-health cc-config-generate cc-property-files cc-kafka-validate cc-sr-validate cc-tableflow-key-create cc-tableflow-properties confluent-env-export
 
 # Default target
 .DEFAULT_GOAL := help
@@ -79,7 +80,7 @@ help: ## ⚙️ Show this help message
 > @echo
 > @echo -e "$(YELLOW)Available targets:$(RESET)"
 > @echo
-> @grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(CYAN)%-15s$(RESET) %s\n", $$1, $$2}'
+> @grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(CYAN)%-15s$(RESET)	%s\n", $$1,$$2}'
 > @echo
 > @echo -e "$(YELLOW)Environment:$(RESET)"
 > @echo -e "  $(BLUE)PREFIX$(RESET)         = $(PREFIX)"
@@ -181,7 +182,7 @@ build: ## ⚙️ Build all utilities and dependencies
 > @echo -e "$(YELLOW)$(INFO) No compilation needed for shell scripts$(RESET)"
 
 # Test target for comprehensive test execution
-test: ## 🧪 Run all validation tests
+test: ## 🧪 Run unit and integration test suite
 > @echo -e "$(BLUE)$(TEST) Running test suite$(RESET)"
 > @echo -e "$(BLUE)==================$(RESET)"
 > @if [ ! -d "$(TESTS_DIR)" ]; then \
@@ -521,7 +522,7 @@ validate-flink: ## 🔍 Validate Flink connectivity
 >   exit 1; \
 > fi
 
-validate-all: ## 🔍 Run all validation tests
+validate-all: ## 🔍 Run all connectivity validation tests
 > @echo -e "$(BLUE)$(VALIDATE) Running all validation tests$(RESET)"
 > @echo -e "$(BLUE)==============================$(RESET)"
 > @$(MAKE) validate-kafka

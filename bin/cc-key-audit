@@ -143,9 +143,6 @@ calculate_age() {
 output_table() {
     local keys_data="$1"
     
-    echo -e "\n${AUDIT} ${BLUE}API Key Audit Results${NC}"
-    echo "============================="
-    
     if ! command_exists jq; then
         print_status error "jq required for processing"
         return 1
@@ -154,20 +151,111 @@ output_table() {
     local count=$(echo "$keys_data" | jq 'length' 2>/dev/null || echo "0")
     
     if [[ "$count" -eq 0 ]]; then
+        echo
         print_status warning "No API keys found"
         return
     fi
     
-    printf "%-20s %-15s %-40s %-8s\n" "Key" "Type" "Description" "Age (days)"
-    printf "%-20s %-15s %-40s %-8s\n" "----" "----" "-----------" "---------"
+    # Calculate statistics
+    local kafka_count=$(echo "$keys_data" | jq '[.[] | select(.resource_type == "kafka")] | length' 2>/dev/null || echo "0")
+    local sr_count=$(echo "$keys_data" | jq '[.[] | select(.resource_type == "schema-registry")] | length' 2>/dev/null || echo "0")
+    local cloud_count=$(echo "$keys_data" | jq '[.[] | select(.resource_type == "cloud")] | length' 2>/dev/null || echo "0")
+    local flink_count=$(echo "$keys_data" | jq '[.[] | select(.resource_type == "flink-region")] | length' 2>/dev/null || echo "0")
+    local old_keys=$(echo "$keys_data" | jq '[.[] | select((if .created then (now - (.created | fromdateiso8601)) / 86400 | floor else 0 end) > 90)] | length' 2>/dev/null || echo "0")
+    local very_old_keys=$(echo "$keys_data" | jq '[.[] | select((if .created then (now - (.created | fromdateiso8601)) / 86400 | floor else 0 end) > 365)] | length' 2>/dev/null || echo "0")
     
-    echo "$keys_data" | jq -r '.[] | [.key[0:19], .resource_type[0:14], .description[0:39], (if .created then (now - (.created | fromdateiso8601)) / 86400 | floor else 0 end)] | @tsv' 2>/dev/null | \
+    # Display summary box (72 chars wide)
+    echo
+    echo -e "${BLUE}╔════════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║${NC}                   🔍 API Key Audit Summary                          ${BLUE}║${NC}"
+    echo -e "${BLUE}╠════════════════════════════════════════════════════════════════════════╣${NC}"
+    
+    # Format numbers with padding
+    local total_str=$(printf "%-2s" "$count")
+    local kafka_str=$(printf "%-2s" "$kafka_count")
+    local sr_str=$(printf "%-2s" "$sr_count")
+    local cloud_str=$(printf "%-2s" "$cloud_count")
+    local flink_str=$(printf "%-2s" "$flink_count")
+    local old_str=$(printf "%-2s" "$old_keys")
+    
+    # Line 1: Total Keys: XX  │  Kafka: X   │  Schema Registry: X
+    echo -e "${BLUE}║${NC}  ${GREEN}Total Keys:${NC} ${total_str}       ${BLUE}│${NC}  ${YELLOW}Kafka:${NC} ${kafka_str}   ${BLUE}│${NC}  ${YELLOW}Schema Registry:${NC} ${sr_str}        ${BLUE}║${NC}"
+    # Line 2: Cloud: X         │  Flink: X   │  Old (>90d): X
+    echo -e "${BLUE}║${NC}  ${YELLOW}Cloud:${NC} ${cloud_str}           ${BLUE}│${NC}  ${YELLOW}Flink:${NC} ${flink_str}   ${BLUE}│${NC}  ${RED}Old (>90d):${NC} ${old_str}             ${BLUE}║${NC}"
+    echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════════╝${NC}"
+    echo
+    
+    # Display keys table
+    echo -e "${BLUE}┌────────────────────┬─────────────────┬──────────────────────────────────────────┬──────────┐${NC}"
+    printf "${BLUE}│${NC} %-18s ${BLUE}│${NC} %-15s ${BLUE}│${NC} %-40s ${BLUE}│${NC} %-8s ${BLUE}│${NC}\n" "Key" "Type" "Description" "Age"
+    echo -e "${BLUE}├────────────────────┼─────────────────┼──────────────────────────────────────────┼──────────┤${NC}"
+    
+    echo "$keys_data" | jq -r '.[] | [.key[0:18], .resource_type[0:15], .description[0:40], (if .created then (now - (.created | fromdateiso8601)) / 86400 | floor else 0 end)] | @tsv' 2>/dev/null | \
     while IFS=$'\t' read -r key type desc age; do
-        printf "%-20s %-15s %-40s %-8s\n" "$key" "$type" "$desc" "$age"
+        # Truncate/pad to exact widths
+        key=$(printf "%-18.18s" "$key")
+        type=$(printf "%-15.15s" "$type")
+        desc=$(printf "%-40.40s" "$desc")
+        
+        # Determine age display and warning
+        local age_display="${age}d"
+        local age_warning=""
+        if [[ $age -gt 365 ]]; then
+            age_warning="⚠️ "
+        elif [[ $age -gt 90 ]]; then
+            age_warning="⚠️ "
+        fi
+        
+        # Color code by type
+        local type_color="${NC}"
+        case "$type" in
+            kafka)
+                type_color="${GREEN}"
+                ;;
+            schema-registry)
+                type_color="${BLUE}"
+                ;;
+            cloud)
+                type_color="${YELLOW}"
+                ;;
+            flink-region)
+                type_color="${BLUE}"
+                ;;
+        esac
+        
+        # Color code by age
+        local age_color="${GREEN}"
+        if [[ $age -gt 365 ]]; then
+            age_color="${RED}"
+        elif [[ $age -gt 90 ]]; then
+            age_color="${YELLOW}"
+        fi
+        
+        # Format age field to exactly 8 characters
+        local age_field=$(printf "%-5s" "$age_display")
+        if [[ -n "$age_warning" ]]; then
+            age_field="${age_field}${age_warning}"
+        else
+            age_field=$(printf "%-8s" "$age_field")
+        fi
+        
+        # Print row with colors applied AFTER padding
+        echo -e "${BLUE}│${NC} ${key} ${BLUE}│${NC} ${type_color}${type}${NC} ${BLUE}│${NC} ${desc} ${BLUE}│${NC} ${age_color}${age_field}${NC} ${BLUE}│${NC}"
     done
     
+    echo -e "${BLUE}└────────────────────┴─────────────────┴──────────────────────────────────────────┴──────────┘${NC}"
     echo
-    print_status success "Found $count API keys"
+    
+    # Display warnings if needed
+    if [[ $very_old_keys -gt 0 ]]; then
+        print_status warning "Found $very_old_keys key(s) older than 1 year - consider rotating"
+    fi
+    
+    if [[ $old_keys -gt 0 ]] && [[ $very_old_keys -eq 0 ]]; then
+        print_status info "Found $old_keys key(s) older than 90 days"
+    fi
+    
+    print_status success "Audit completed - $count API keys analyzed"
 }
 
 # Output JSON format
@@ -190,54 +278,68 @@ main() {
     # Parse arguments
     parse_args "$@"
     
-    # Show header
-    echo -e "${BLUE}${AUDIT} $SCRIPT_DESCRIPTION${NC}"
-    echo "=============================="
+    # Show header (72 chars wide)
+    echo
+    echo -e "${BLUE}╔════════════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║${NC}        🔍 Confluent Cloud API Key Audit v${SCRIPT_VERSION}                  ${BLUE}║${NC}"
+    echo -e "${BLUE}╚════════════════════════════════════════════════════════════════════════╝${NC}"
+    echo
     
     # Check prerequisites
+    echo -e "${INFO} ${BLUE}Checking prerequisites...${NC}"
+    
     if ! command_exists confluent; then
         print_status error "confluent CLI not found. Please install it first."
         exit 1
     fi
+    print_status success "confluent CLI found"
     
     if ! command_exists jq; then
         print_status error "jq not found. Please install it first."
         exit 1
     fi
+    print_status success "jq found"
     
     # Check if authenticated by trying to list environments
+    echo
+    echo -e "${INFO} ${BLUE}Verifying authentication...${NC}"
     if ! confluent environment list >/dev/null 2>&1; then
         print_status error "confluent CLI not authenticated. Please run 'confluent login' first."
         exit 1
     fi
-    
-    print_status success "confluent CLI is authenticated"
+    print_status success "Authentication verified"
     
     # Get API keys
+    echo
+    echo -e "${INFO} ${BLUE}Retrieving API keys...${NC}"
     local keys_data
     if ! keys_data=$(get_api_keys); then
         exit 1
     fi
     
     if [[ -z "$keys_data" || "$keys_data" == "[]" ]]; then
+        echo
         print_status warning "No API keys found"
         exit 0
     fi
     
+    local key_count=$(echo "$keys_data" | jq 'length' 2>/dev/null || echo "0")
+    print_status success "Retrieved $key_count API keys"
+    
     # Output results based on format
     case "$(echo "$OUTPUT_FORMAT" | tr '[:upper:]' '[:lower:]')" in
         json)
+            echo
             output_json "$keys_data"
             ;;
         csv)
+            echo
             output_csv "$keys_data"
             ;;
         table|*)
             output_table "$keys_data"
             ;;
     esac
-    
-    print_status success "Audit completed successfully"
 }
 
 # Run main function
