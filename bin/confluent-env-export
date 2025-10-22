@@ -35,6 +35,8 @@ ${YELLOW}Options:${RESET}
   -n, --dry-run              Show what would be generated without creating files
   --create-keys              Automatically create missing API keys
   --skip-sr                  Skip Schema Registry setup
+  --skip-flink               Skip Flink compute pool setup
+  --skip-tableflow           Skip TableFlow setup
   -h, --help                 Show this help message
 
 ${YELLOW}Examples:${RESET}
@@ -83,6 +85,14 @@ parse_args() {
                 ;;
             --skip-sr)
                 SKIP_SR="true"
+                shift
+                ;;
+            --skip-flink)
+                SKIP_FLINK="true"
+                shift
+                ;;
+            --skip-tableflow)
+                SKIP_TABLEFLOW="true"
                 shift
                 ;;
             -h|--help)
@@ -195,17 +205,57 @@ discover_kafka_cluster() {
         return 1
     fi
     
-    # Use first/current cluster
-    local cluster_info=$(echo "$cluster_output" | jq -r '.[0]')
-    KAFKA_CLUSTER_ID=$(echo "$cluster_info" | jq -r '.id')
-    KAFKA_CLUSTER_NAME=$(echo "$cluster_info" | jq -r '.name')
-    KAFKA_ENDPOINT=$(echo "$cluster_info" | jq -r '.endpoint')
-    KAFKA_REGION=$(echo "$cluster_info" | jq -r '.region')
-    KAFKA_CLOUD=$(echo "$cluster_info" | jq -r '.cloud')
+    # If only one cluster, use it automatically
+    if [[ "$cluster_count" -eq 1 ]]; then
+        local cluster_info=$(echo "$cluster_output" | jq -r '.[0]')
+        KAFKA_CLUSTER_ID=$(echo "$cluster_info" | jq -r '.id')
+        KAFKA_CLUSTER_NAME=$(echo "$cluster_info" | jq -r '.name')
+        KAFKA_ENDPOINT=$(echo "$cluster_info" | jq -r '.endpoint')
+        KAFKA_REGION=$(echo "$cluster_info" | jq -r '.region')
+        KAFKA_CLOUD=$(echo "$cluster_info" | jq -r '.cloud')
+        
+        success "Found Kafka cluster: $KAFKA_CLUSTER_NAME ($KAFKA_CLUSTER_ID)"
+        debug "Endpoint: $KAFKA_ENDPOINT"
+        debug "Region: $KAFKA_REGION, Cloud: $KAFKA_CLOUD"
+        return 0
+    fi
     
-    success "Found Kafka cluster: $KAFKA_CLUSTER_NAME ($KAFKA_CLUSTER_ID)"
-    debug "Endpoint: $KAFKA_ENDPOINT"
-    debug "Region: $KAFKA_REGION, Cloud: $KAFKA_CLOUD"
+    # Multiple clusters - show selection menu
+    echo -e "${BLUE}${SEARCH} Available Kafka clusters:${RESET}"
+    
+    local index=1
+    echo "$cluster_output" | jq -r '.[] | @json' | while read -r cluster_line; do
+        local cluster_id=$(echo "$cluster_line" | jq -r '.id')
+        local cluster_name=$(echo "$cluster_line" | jq -r '.name')
+        local cluster_region=$(echo "$cluster_line" | jq -r '.region')
+        local cluster_cloud=$(echo "$cluster_line" | jq -r '.cloud')
+        local cluster_status=$(echo "$cluster_line" | jq -r '.status // "UNKNOWN"')
+        
+        printf "  ${CYAN}%d)${RESET} %s (${BLUE}%s${RESET}) - %s/%s [%s]\n" \
+            "$index" "$cluster_name" "$cluster_id" "$cluster_cloud" "$cluster_region" "$cluster_status"
+        ((index++))
+    done
+    
+    echo
+    while true; do
+        read -p "$(echo -e "${YELLOW}Select Kafka cluster [1-$cluster_count]:${RESET} ")" choice
+        
+        if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && [[ $choice -le $cluster_count ]]; then
+            local selected_cluster=$(echo "$cluster_output" | jq -r ".[$((choice-1))]")
+            KAFKA_CLUSTER_ID=$(echo "$selected_cluster" | jq -r '.id')
+            KAFKA_CLUSTER_NAME=$(echo "$selected_cluster" | jq -r '.name')
+            KAFKA_ENDPOINT=$(echo "$selected_cluster" | jq -r '.endpoint')
+            KAFKA_REGION=$(echo "$selected_cluster" | jq -r '.region')
+            KAFKA_CLOUD=$(echo "$selected_cluster" | jq -r '.cloud')
+            
+            success "Selected Kafka cluster: $KAFKA_CLUSTER_NAME ($KAFKA_CLUSTER_ID)"
+            debug "Endpoint: $KAFKA_ENDPOINT"
+            debug "Region: $KAFKA_REGION, Cloud: $KAFKA_CLOUD"
+            break
+        else
+            warning "Invalid choice. Please enter a number between 1 and $cluster_count"
+        fi
+    done
 }
 
 # Check for existing Kafka API keys
@@ -453,6 +503,332 @@ create_sr_api_key() {
     fi
 }
 
+# Discover Flink compute pool
+discover_flink_compute_pool() {
+    if [[ "$SKIP_FLINK" == "true" ]]; then
+        info "Skipping Flink compute pool setup"
+        return 0
+    fi
+    
+    progress "Checking Flink compute pools"
+    
+    # Try to list Flink compute pools
+    local pool_output
+    if ! pool_output=$(confluent flink compute-pool list -o json 2>/dev/null); then
+        warning "Failed to list Flink compute pools"
+        debug "CLI command failed or Flink not available"
+        return 0
+    fi
+    
+    # Check if output is valid JSON
+    if ! echo "$pool_output" | jq empty 2>/dev/null; then
+        warning "Invalid JSON response from Flink compute pool list"
+        debug "Raw output: $pool_output"
+        return 0
+    fi
+    
+    local pool_count=$(echo "$pool_output" | jq 'length' 2>/dev/null || echo "0")
+    
+    if [[ "$pool_count" -eq 0 ]]; then
+        info "No Flink compute pools found in this environment"
+        return 0
+    fi
+    
+    # If only one compute pool, use it automatically
+    if [[ "$pool_count" -eq 1 ]]; then
+        local pool_info=$(echo "$pool_output" | jq -r '.[0]')
+        FLINK_COMPUTE_POOL_ID=$(echo "$pool_info" | jq -r '.id')
+        FLINK_COMPUTE_POOL_NAME=$(echo "$pool_info" | jq -r '.name')
+        FLINK_REGION=$(echo "$pool_info" | jq -r '.region')
+        FLINK_CLOUD=$(echo "$pool_info" | jq -r '.cloud')
+        
+        success "Found Flink compute pool: $FLINK_COMPUTE_POOL_NAME ($FLINK_COMPUTE_POOL_ID)"
+        debug "Region: $FLINK_REGION, Cloud: $FLINK_CLOUD"
+        return 0
+    fi
+    
+    # Multiple compute pools - show selection menu
+    echo -e "${BLUE}${SEARCH} Available Flink compute pools:${RESET}"
+    
+    local index=1
+    echo "$pool_output" | jq -r '.[] | @json' | while read -r pool_line; do
+        local pool_id=$(echo "$pool_line" | jq -r '.id')
+        local pool_name=$(echo "$pool_line" | jq -r '.name')
+        local pool_region=$(echo "$pool_line" | jq -r '.region')
+        local pool_cloud=$(echo "$pool_line" | jq -r '.cloud')
+        local pool_status=$(echo "$pool_line" | jq -r '.status // "UNKNOWN"')
+        
+        printf "  ${CYAN}%d)${RESET} %s (${BLUE}%s${RESET}) - %s/%s [%s]\n" \
+            "$index" "$pool_name" "$pool_id" "$pool_cloud" "$pool_region" "$pool_status"
+        ((index++))
+    done
+    
+    echo
+    while true; do
+        read -p "$(echo -e "${YELLOW}Select Flink compute pool [1-$pool_count]:${RESET} ")" choice
+        
+        if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && [[ $choice -le $pool_count ]]; then
+            local selected_pool=$(echo "$pool_output" | jq -r ".[$((choice-1))]")
+            FLINK_COMPUTE_POOL_ID=$(echo "$selected_pool" | jq -r '.id')
+            FLINK_COMPUTE_POOL_NAME=$(echo "$selected_pool" | jq -r '.name')
+            FLINK_REGION=$(echo "$selected_pool" | jq -r '.region')
+            FLINK_CLOUD=$(echo "$selected_pool" | jq -r '.cloud')
+            
+            success "Selected Flink compute pool: $FLINK_COMPUTE_POOL_NAME ($FLINK_COMPUTE_POOL_ID)"
+            debug "Region: $FLINK_REGION, Cloud: $FLINK_CLOUD"
+            break
+        else
+            warning "Invalid choice. Please enter a number between 1 and $pool_count"
+        fi
+    done
+}
+
+# Check for existing Flink API keys
+check_flink_api_keys() {
+    progress "Checking API keys for Flink compute pool"
+    
+    local keys_output
+    if ! keys_output=$(confluent api-key list --resource "$FLINK_COMPUTE_POOL_ID" -o json 2>/dev/null); then
+        warning "Failed to list API keys for Flink compute pool"
+        
+        # Prompt to create new key
+        if [[ "$CREATE_KEYS" == "true" ]] || confirm "Create Flink API key?"; then
+            create_flink_api_key
+        else
+            info "Skipping Flink configuration"
+            # Clear Flink variables to skip configuration
+            FLINK_COMPUTE_POOL_ID=""
+            FLINK_COMPUTE_POOL_NAME=""
+            FLINK_REGION=""
+            FLINK_CLOUD=""
+            return 0
+        fi
+        return 0
+    fi
+    
+    # Find Flink keys for this compute pool
+    local flink_keys=$(echo "$keys_output" | jq --arg pool_id "$FLINK_COMPUTE_POOL_ID" '
+        map(select(.resource_type == "flink" and .resource == $pool_id))')
+    
+    local flink_key_count=$(echo "$flink_keys" | jq 'length')
+    
+    if [[ "$flink_key_count" -eq 0 ]]; then
+        warning "No API keys found for Flink compute pool: $FLINK_COMPUTE_POOL_ID"
+        
+        if [[ "$CREATE_KEYS" == "true" ]] || confirm "Create Flink API key?"; then
+            create_flink_api_key
+        else
+            info "Skipping Flink configuration"
+            # Clear Flink variables to skip configuration
+            FLINK_COMPUTE_POOL_ID=""
+            FLINK_COMPUTE_POOL_NAME=""
+            FLINK_REGION=""
+            FLINK_CLOUD=""
+        fi
+    else
+        # Use first available key
+        local key_info=$(echo "$flink_keys" | jq -r '.[0]')
+        FLINK_API_KEY=$(echo "$key_info" | jq -r '.key')
+        local key_description=$(echo "$key_info" | jq -r '.description // "No description"')
+        
+        success "Using existing Flink API key: $FLINK_API_KEY"
+        debug "Key description: $key_description"
+        warning "API secret cannot be retrieved from existing keys"
+        
+        if [[ "$CREATE_KEYS" == "true" ]] || confirm "Create new Flink API key to get secret?"; then
+            create_flink_api_key
+        else
+            FLINK_API_SECRET="<replace-with-your-flink-api-secret>"
+        fi
+    fi
+}
+
+# Create Flink API key
+create_flink_api_key() {
+    progress "Creating Flink API key"
+    
+    local description="Created by $SCRIPT_NAME on $(date) for $FLINK_COMPUTE_POOL_NAME"
+    
+    if is_dry_run; then
+        info "DRY RUN: Would create Flink API key for compute pool: $FLINK_COMPUTE_POOL_ID"
+        FLINK_API_KEY="DRY-RUN-FLINK-KEY"
+        FLINK_API_SECRET="DRY-RUN-FLINK-SECRET"
+        return 0
+    fi
+    
+    local key_output
+    if ! key_output=$(confluent api-key create --resource "$FLINK_COMPUTE_POOL_ID" --description "$description" 2>/dev/null); then
+        warning "Failed to create Flink API key"
+        debug "CLI command failed for compute pool: $FLINK_COMPUTE_POOL_ID"
+        # Clear Flink variables to skip configuration
+        FLINK_COMPUTE_POOL_ID=""
+        FLINK_COMPUTE_POOL_NAME=""
+        FLINK_REGION=""
+        FLINK_CLOUD=""
+        return 0
+    fi
+    
+    # Parse key and secret from output
+    FLINK_API_KEY=$(echo "$key_output" | grep "| API Key" | awk -F'|' '{print $3}' | tr -d ' ')
+    FLINK_API_SECRET=$(echo "$key_output" | grep "| API Secret" | awk -F'|' '{print $3}' | tr -d ' ')
+    
+    # Validate that both key and secret were successfully parsed
+    if [[ -z "$FLINK_API_KEY" || -z "$FLINK_API_SECRET" ]]; then
+        warning "Failed to parse Flink API key from output"
+        debug "Raw output: $key_output"
+        # Clear Flink variables to skip configuration
+        FLINK_COMPUTE_POOL_ID=""
+        FLINK_COMPUTE_POOL_NAME=""
+        FLINK_REGION=""
+        FLINK_CLOUD=""
+        return 0
+    fi
+    
+    success "Created Flink API key: $FLINK_API_KEY"
+}
+
+# Discover TableFlow
+discover_tableflow() {
+    if [[ "$SKIP_TABLEFLOW" == "true" ]]; then
+        info "Skipping TableFlow setup"
+        return 0
+    fi
+    
+    progress "Checking TableFlow availability"
+    
+    # Get organization ID from environment description
+    local env_output
+    if ! env_output=$(confluent environment describe "$SELECTED_ENV_ID" -o json 2>/dev/null); then
+        warning "Failed to describe environment for TableFlow discovery"
+        debug "CLI command failed"
+        return 0
+    fi
+    
+    # Check if output is valid JSON
+    if ! echo "$env_output" | jq empty 2>/dev/null; then
+        warning "Invalid JSON response from environment describe"
+        debug "Raw output: $env_output"
+        return 0
+    fi
+    
+    # Extract organization ID
+    TF_ORG_ID=$(echo "$env_output" | jq -r '.organization_id // empty')
+    
+    if [[ -z "$TF_ORG_ID" ]]; then
+        info "TableFlow not available (organization ID not found)"
+        return 0
+    fi
+    
+    # Generate TableFlow catalog URL
+    # Format: https://tableflow.{region}.{cloud}.confluent.cloud/iceberg/catalog/organizations/{org_id}/environments/{env_id}
+    local region_lower=$(echo "$KAFKA_REGION" | tr '[:upper:]' '[:lower:]')
+    local cloud_lower=$(echo "$KAFKA_CLOUD" | tr '[:upper:]' '[:lower:]')
+    TF_CATALOG_URL="https://tableflow.${region_lower}.${cloud_lower}.confluent.cloud/iceberg/catalog/organizations/${TF_ORG_ID}/environments/${SELECTED_ENV_ID}"
+    
+    success "Found TableFlow catalog"
+    debug "Organization ID: $TF_ORG_ID"
+    debug "Catalog URL: $TF_CATALOG_URL"
+}
+
+# Check for existing TableFlow API keys
+check_tableflow_api_keys() {
+    progress "Checking TableFlow API keys"
+    
+    # TableFlow uses environment-scoped API keys
+    local keys_output
+    if ! keys_output=$(confluent api-key list -o json 2>/dev/null); then
+        warning "Failed to list API keys for TableFlow"
+        
+        # Prompt to create new key
+        if [[ "$CREATE_KEYS" == "true" ]] || confirm "Create TableFlow API key?"; then
+            create_tableflow_api_key
+        else
+            info "Skipping TableFlow configuration"
+            # Clear TableFlow variables to skip configuration
+            TF_ORG_ID=""
+            TF_CATALOG_URL=""
+            return 0
+        fi
+        return 0
+    fi
+    
+    # Find environment-scoped keys (could be used for TableFlow)
+    # Note: TableFlow may use cloud-level or environment-scoped keys
+    local env_keys=$(echo "$keys_output" | jq --arg env_id "$SELECTED_ENV_ID" '
+        map(select(.resource_type == "cloud" or (.resource_type == "environment" and .resource == $env_id)))')
+    
+    local env_key_count=$(echo "$env_keys" | jq 'length')
+    
+    if [[ "$env_key_count" -eq 0 ]]; then
+        warning "No API keys found for TableFlow"
+        
+        if [[ "$CREATE_KEYS" == "true" ]] || confirm "Create TableFlow API key?"; then
+            create_tableflow_api_key
+        else
+            info "Skipping TableFlow configuration"
+            # Clear TableFlow variables to skip configuration
+            TF_ORG_ID=""
+            TF_CATALOG_URL=""
+        fi
+    else
+        # Use first available key
+        local key_info=$(echo "$env_keys" | jq -r '.[0]')
+        TF_API_KEY=$(echo "$key_info" | jq -r '.key')
+        local key_description=$(echo "$key_info" | jq -r '.description // "No description"')
+        
+        success "Using existing API key for TableFlow: $TF_API_KEY"
+        debug "Key description: $key_description"
+        warning "API secret cannot be retrieved from existing keys"
+        
+        if [[ "$CREATE_KEYS" == "true" ]] || confirm "Create new TableFlow API key to get secret?"; then
+            create_tableflow_api_key
+        else
+            TF_API_SECRET="<replace-with-your-tableflow-api-secret>"
+        fi
+    fi
+}
+
+# Create TableFlow API key
+create_tableflow_api_key() {
+    progress "Creating TableFlow API key"
+    
+    local description="Created by $SCRIPT_NAME on $(date) for TableFlow"
+    
+    if is_dry_run; then
+        info "DRY RUN: Would create TableFlow API key"
+        TF_API_KEY="DRY-RUN-TABLEFLOW-KEY"
+        TF_API_SECRET="DRY-RUN-TABLEFLOW-SECRET"
+        return 0
+    fi
+    
+    # TableFlow uses cloud-level API keys
+    local key_output
+    if ! key_output=$(confluent api-key create --resource cloud --description "$description" 2>/dev/null); then
+        warning "Failed to create TableFlow API key"
+        debug "CLI command failed"
+        # Clear TableFlow variables to skip configuration
+        TF_ORG_ID=""
+        TF_CATALOG_URL=""
+        return 0
+    fi
+    
+    # Parse key and secret from output
+    TF_API_KEY=$(echo "$key_output" | grep "| API Key" | awk -F'|' '{print $3}' | tr -d ' ')
+    TF_API_SECRET=$(echo "$key_output" | grep "| API Secret" | awk -F'|' '{print $3}' | tr -d ' ')
+    
+    # Validate that both key and secret were successfully parsed
+    if [[ -z "$TF_API_KEY" || -z "$TF_API_SECRET" ]]; then
+        warning "Failed to parse TableFlow API key from output"
+        debug "Raw output: $key_output"
+        # Clear TableFlow variables to skip configuration
+        TF_ORG_ID=""
+        TF_CATALOG_URL=""
+        return 0
+    fi
+    
+    success "Created TableFlow API key: $TF_API_KEY"
+}
+
 # Generate .env file
 generate_env_file() {
     local env_file="$1"
@@ -475,6 +851,11 @@ generate_env_file() {
     cat > "$env_file" << EOF
 # Generated by $SCRIPT_NAME on $(date)
 # Confluent Cloud Environment Configuration - CC_ prefix format
+#
+# SECURITY WARNING: This file contains sensitive API credentials.
+# - Keep this file secure and never commit it to version control
+# - File permissions are set to 600 (read/write for owner only)
+# - Rotate API keys regularly for security best practices
 
 # Environment Information
 export CC_ENV=$SELECTED_ENV_ID
@@ -500,6 +881,31 @@ export CC_SR_ID=$SR_CLUSTER_ID
 export CC_SR_HOST=${SR_ENDPOINT#https://}
 export CC_SR_API_KEY=${SR_API_KEY:-}
 export CC_SR_API_SECRET=${SR_API_SECRET:-}
+
+EOF
+    fi
+    
+    # Add Flink configuration if available
+    if [[ -n "$FLINK_COMPUTE_POOL_ID" ]]; then
+        cat >> "$env_file" << EOF
+# Flink Compute Pool Configuration
+export CC_FLINK_COMPUTE_POOL=$FLINK_COMPUTE_POOL_ID
+export CC_FLINK_REGION=$FLINK_REGION
+export CC_FLINK_CLOUD=$FLINK_CLOUD
+export CC_FLINK_API_KEY=${FLINK_API_KEY:-}
+export CC_FLINK_API_SECRET=${FLINK_API_SECRET:-}
+
+EOF
+    fi
+    
+    # Add TableFlow configuration if available
+    if [[ -n "$TF_ORG_ID" && -n "$TF_CATALOG_URL" ]]; then
+        cat >> "$env_file" << EOF
+# TableFlow Configuration
+export CC_TF_API_KEY=${TF_API_KEY:-}
+export CC_TF_API_SECRET=${TF_API_SECRET:-}
+export CC_TF_CATALOG_URL=$TF_CATALOG_URL
+export CC_ORG_ID=$TF_ORG_ID
 
 EOF
     fi
@@ -534,6 +940,22 @@ export CONFLUENT_SCHEMA_REGISTRY_API_SECRET=\$CC_SR_API_SECRET
 EOF
     fi
     
+    if [[ -n "$FLINK_COMPUTE_POOL_ID" ]]; then
+        cat >> "$env_file" << EOF
+export CONFLUENT_FLINK_COMPUTE_POOL=\$CC_FLINK_COMPUTE_POOL
+export CONFLUENT_FLINK_API_KEY=\$CC_FLINK_API_KEY
+export CONFLUENT_FLINK_API_SECRET=\$CC_FLINK_API_SECRET
+EOF
+    fi
+    
+    if [[ -n "$TF_ORG_ID" && -n "$TF_CATALOG_URL" ]]; then
+        cat >> "$env_file" << EOF
+export CONFLUENT_TABLEFLOW_API_KEY=\$CC_TF_API_KEY
+export CONFLUENT_TABLEFLOW_API_SECRET=\$CC_TF_API_SECRET
+export CONFLUENT_TABLEFLOW_CATALOG_URL=\$CC_TF_CATALOG_URL
+EOF
+    fi
+    
     cat >> "$env_file" << EOF
 
 # Optional: Custom Configuration Directory
@@ -548,6 +970,9 @@ EOF
 
 EOF
     
+    # Set secure file permissions (read/write for owner only)
+    chmod 600 "$env_file"
+    
     success "Generated .env successfully!"
     
     # Show next steps
@@ -560,7 +985,33 @@ EOF
     echo -e "  ${CYAN}echo \$CC_KAFKA_BROKER${RESET}"
     echo -e "  ${CYAN}echo \$CONFLUENT_BOOTSTRAP_SERVERS${RESET}"
     echo
-    info "Test with utilities:"
+    info "Test Kafka connectivity:"
+    echo -e "  ${CYAN}confluent kafka topic list${RESET}"
+    
+    # Add Schema Registry validation if configured
+    if [[ -n "$SR_CLUSTER_ID" ]]; then
+        echo
+        info "Test Schema Registry connectivity:"
+        echo -e "  ${CYAN}confluent schema-registry schema list${RESET}"
+    fi
+    
+    # Add Flink validation if configured
+    if [[ -n "$FLINK_COMPUTE_POOL_ID" ]]; then
+        echo
+        info "Test Flink connectivity:"
+        echo -e "  ${CYAN}confluent flink compute-pool describe $FLINK_COMPUTE_POOL_ID${RESET}"
+        echo -e "  ${CYAN}confluent flink statement list${RESET}"
+    fi
+    
+    # Add TableFlow validation if configured
+    if [[ -n "$TF_ORG_ID" && -n "$TF_CATALOG_URL" ]]; then
+        echo
+        info "Test TableFlow connectivity:"
+        echo -e "  ${CYAN}curl -u \$CC_TF_API_KEY:\$CC_TF_API_SECRET \$CC_TF_CATALOG_URL/v1/config${RESET}"
+    fi
+    
+    echo
+    info "Use project utilities:"
     echo -e "  ${CYAN}./bin/cc-key-list${RESET}"
     echo -e "  ${CYAN}gmake generate-props${RESET}"
 }
@@ -581,6 +1032,22 @@ show_env_preview() {
             echo -e "${CYAN}SR API Key:${RESET} $SR_API_KEY"
         fi
     fi
+    
+    if [[ -n "$FLINK_COMPUTE_POOL_ID" ]]; then
+        echo -e "${CYAN}Flink Compute Pool:${RESET} $FLINK_COMPUTE_POOL_NAME ($FLINK_COMPUTE_POOL_ID)"
+        echo -e "${CYAN}Flink Region:${RESET} $FLINK_REGION ($FLINK_CLOUD)"
+        if [[ -n "$FLINK_API_KEY" ]]; then
+            echo -e "${CYAN}Flink API Key:${RESET} $FLINK_API_KEY"
+        fi
+    fi
+    
+    if [[ -n "$TF_ORG_ID" && -n "$TF_CATALOG_URL" ]]; then
+        echo -e "${CYAN}TableFlow Catalog:${RESET} $TF_CATALOG_URL"
+        echo -e "${CYAN}Organization ID:${RESET} $TF_ORG_ID"
+        if [[ -n "$TF_API_KEY" ]]; then
+            echo -e "${CYAN}TableFlow API Key:${RESET} $TF_API_KEY"
+        fi
+    fi
 }
 
 # Main function
@@ -596,6 +1063,8 @@ main() {
     FORCE_OVERWRITE="${FORCE_OVERWRITE:-false}"
     CREATE_KEYS="${CREATE_KEYS:-false}"
     SKIP_SR="${SKIP_SR:-false}"
+    SKIP_FLINK="${SKIP_FLINK:-false}"
+    SKIP_TABLEFLOW="${SKIP_TABLEFLOW:-false}"
     
     # Show header
     if ! is_quiet; then
@@ -632,6 +1101,26 @@ main() {
     
     # Discover Schema Registry
     discover_schema_registry
+    
+    # Discover Flink compute pool
+    if [[ "$SKIP_FLINK" != "true" ]]; then
+        discover_flink_compute_pool
+        
+        # Create/check Flink API keys if compute pool was discovered
+        if [[ -n "$FLINK_COMPUTE_POOL_ID" ]]; then
+            check_flink_api_keys
+        fi
+    fi
+    
+    # Discover TableFlow
+    if [[ "$SKIP_TABLEFLOW" != "true" ]]; then
+        discover_tableflow
+        
+        # Create/check TableFlow API keys if TableFlow was discovered
+        if [[ -n "$TF_ORG_ID" && -n "$TF_CATALOG_URL" ]]; then
+            check_tableflow_api_keys
+        fi
+    fi
     
     # Generate .env file
     if ! generate_env_file "$ENV_FILE"; then

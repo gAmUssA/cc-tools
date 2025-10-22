@@ -41,6 +41,10 @@ AUDIT := 🔍
 BACKUP := 💾
 TEST := 🧪
 PACKAGE := 📦
+VALIDATE := 🔍
+SUCCESS := ✅
+TABLEFLOW := 🏔️
+SEARCH := 🔍
 
 # Project directories
 BIN_DIR := bin
@@ -64,6 +68,9 @@ UTILITIES := cc-key-create cc-key-rotate cc-key-audit cc-key-sync cc-key-health 
 
 # Phony targets
 .PHONY: help install bootstrap test clean audit rotate-all health-check backup status build
+.PHONY: validate-flink validate-tableflow validate-all validate-kafka validate-sr
+.PHONY: list-keys list-kafka list-sr list-flink list-tableflow
+.PHONY: generate-props generate-configs setup-env setup-env-auto create-key
 
 # Help target with colorized output
 help: ## ⚙️ Show this help message
@@ -414,15 +421,26 @@ generate-tableflow-props: ## 🏔️ Generate TableFlow properties file
 
 # Validate TableFlow target
 validate-tableflow: ## 🏔️ Validate TableFlow connectivity
-> @echo -e "$(BLUE)$(TABLEFLOW) Validating TableFlow connectivity$(RESET)"
-> @if [ -f "$(BIN_DIR)/cc-tableflow-validate" ]; then \
->   $(BIN_DIR)/cc-tableflow-validate; \
-> else \
->   echo -e "$(YELLOW)$(WARNING) cc-tableflow-validate utility not implemented yet$(RESET)"; \
->   echo -e "$(CYAN)$(GEAR) Running basic TableFlow validation...$(RESET)"; \
->   if [ -f "$(LIB_DIR)/config.sh" ]; then \
->     source $(LIB_DIR)/config.sh && validate_tableflow_env; \
+> @echo -e "$(BLUE)$(VALIDATE) Validating TableFlow connectivity$(RESET)"
+> @if [ -f ".env" ]; then \
+>   source .env; \
+>   if [ -n "$${CC_TF_CATALOG_URL:-}" ] && [ -n "$${CC_TF_API_KEY:-}" ]; then \
+>     echo -e "$(CYAN)$(GEAR) TableFlow Catalog URL: $${CC_TF_CATALOG_URL}$(RESET)"; \
+>     echo -e "$(CYAN)$(GEAR) Organization ID: $${CC_ORG_ID}$(RESET)"; \
+>     echo -e "$(CYAN)$(GEAR) Testing TableFlow catalog access...$(RESET)"; \
+>     if curl -s -u "$${CC_TF_API_KEY}:$${CC_TF_API_SECRET}" "$${CC_TF_CATALOG_URL}/v1/config" >/dev/null 2>&1; then \
+>       echo -e "$(GREEN)$(CHECK) TableFlow catalog accessible$(RESET)"; \
+>     else \
+>       echo -e "$(YELLOW)$(WARNING) Could not access TableFlow catalog$(RESET)"; \
+>       echo -e "$(CYAN)$(INFO) This may be expected if TableFlow is not fully configured$(RESET)"; \
+>     fi; \
+>   else \
+>     echo -e "$(YELLOW)$(WARNING) TableFlow not configured in .env file$(RESET)"; \
+>     echo -e "$(CYAN)$(INFO) Run 'make setup-env' to configure TableFlow$(RESET)"; \
 >   fi; \
+> else \
+>   echo -e "$(RED)$(ERROR) .env file not found$(RESET)"; \
+>   exit 1; \
 > fi
 
 validate-sr: ## 🔍 Validate Schema Registry connectivity
@@ -480,6 +498,29 @@ validate-kafka-network: ## 🌐 Test Kafka network connectivity
 >   exit 1; \
 > fi
 
+validate-flink: ## 🔍 Validate Flink connectivity
+> @echo -e "$(BLUE)$(VALIDATE) Validating Flink connectivity$(RESET)"
+> @if [ -f ".env" ]; then \
+>   source .env; \
+>   if [ -n "$${CC_FLINK_COMPUTE_POOL:-}" ] && [ -n "$${CC_FLINK_API_KEY:-}" ]; then \
+>     echo -e "$(CYAN)$(GEAR) Flink Compute Pool: $${CC_FLINK_COMPUTE_POOL}$(RESET)"; \
+>     echo -e "$(CYAN)$(GEAR) Region: $${CC_FLINK_REGION}$(RESET)"; \
+>     echo -e "$(CYAN)$(GEAR) Cloud: $${CC_FLINK_CLOUD}$(RESET)"; \
+>     echo -e "$(CYAN)$(GEAR) Testing Flink CLI access...$(RESET)"; \
+>     if confluent flink compute-pool describe "$${CC_FLINK_COMPUTE_POOL}" >/dev/null 2>&1; then \
+>       echo -e "$(GREEN)$(CHECK) Flink compute pool accessible$(RESET)"; \
+>     else \
+>       echo -e "$(YELLOW)$(WARNING) Could not access Flink compute pool$(RESET)"; \
+>     fi; \
+>   else \
+>     echo -e "$(YELLOW)$(WARNING) Flink not configured in .env file$(RESET)"; \
+>     echo -e "$(CYAN)$(INFO) Run 'make setup-env' to configure Flink$(RESET)"; \
+>   fi; \
+> else \
+>   echo -e "$(RED)$(ERROR) .env file not found$(RESET)"; \
+>   exit 1; \
+> fi
+
 validate-all: ## 🔍 Run all validation tests
 > @echo -e "$(BLUE)$(VALIDATE) Running all validation tests$(RESET)"
 > @echo -e "$(BLUE)==============================$(RESET)"
@@ -487,6 +528,17 @@ validate-all: ## 🔍 Run all validation tests
 > @echo
 > @$(MAKE) validate-sr
 > @echo
+> @if [ -f ".env" ]; then \
+>   source .env; \
+>   if [ -n "$${CC_FLINK_COMPUTE_POOL:-}" ]; then \
+>     $(MAKE) validate-flink; \
+>     echo; \
+>   fi; \
+>   if [ -n "$${CC_TF_CATALOG_URL:-}" ]; then \
+>     $(MAKE) validate-tableflow; \
+>     echo; \
+>   fi; \
+> fi
 > @echo -e "$(GREEN)$(SUCCESS) All validation tests completed$(RESET)"
 
 # Clean target for organized cleanup
